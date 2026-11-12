@@ -1,5 +1,6 @@
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
+import { ALL_ENTITIES } from './entities';
 
 /**
  * Configuração do MikroORM (a ORM que conversa com o PostgreSQL).
@@ -12,9 +13,8 @@ export default defineConfig({
   // Endereço do banco, lido do arquivo .env (o Bun carrega o .env sozinho).
   clientUrl: process.env.DATABASE_URL ?? 'postgresql://finance:finance@localhost:5432/finance',
 
-  // Lista de entidades (tabelas). Ainda vazia: vamos preencher na próxima sub-etapa.
-  entities: [],
-  discovery: { warnWhenNoEntities: false },
+  // Lista de entidades (o mapeamento classe ↔ tabela).
+  entities: ALL_ENTITIES,
 
   // Grava e lê datas sempre em UTC, evitando confusão de fuso horário.
   forceUtcTimezone: true,

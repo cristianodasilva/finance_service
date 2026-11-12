@@ -11,6 +11,8 @@ export const FailureCode = {
   CURRENCY_MISMATCH: 'CURRENCY_MISMATCH', // tentativa de misturar moedas diferentes
   INSUFFICIENT_FUNDS: 'INSUFFICIENT_FUNDS', // saldo insuficiente para uma aposta (BET)
   REVERSAL_WOULD_OVERDRAW: 'REVERSAL_WOULD_OVERDRAW', // estorno deixaria o saldo negativo
+  WALLET_NOT_FOUND: 'WALLET_NOT_FOUND', // carteira não existe
+  WALLET_ALREADY_EXISTS: 'WALLET_ALREADY_EXISTS', // jogador já tem carteira nessa moeda
 } as const;
 
 /** Tipo que aceita apenas um dos valores acima (ex.: 'INSUFFICIENT_FUNDS'). */

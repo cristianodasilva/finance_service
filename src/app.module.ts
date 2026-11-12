@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import ormConfig from './database/mikro-orm.config';
 import { HealthModule } from './health/health.module';
+import { WalletsModule } from './wallets/wallets.module';
 
 @Module({
   imports: [
@@ -10,6 +11,7 @@ import { HealthModule } from './health/health.module';
     // assim uma requisição não enxerga as alterações em andamento de outra.
     MikroOrmModule.forRoot({ ...ormConfig, registerRequestContext: true }),
     HealthModule,
+    WalletsModule,
   ],
 })
 export class AppModule {}
