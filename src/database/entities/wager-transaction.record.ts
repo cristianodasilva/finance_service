@@ -1,10 +1,8 @@
 import { EntitySchema } from '@mikro-orm/core';
 
-/** Tipos de transação. OPENING é interno (saldo inicial ao abrir a carteira). */
-export type WagerKind = 'OPENING' | 'BET' | 'WIN' | 'LOSS' | 'REFUND' | 'ROLLBACK';
+import type { WagerKind, WagerStatus } from '../../domain/wager/wager-kind';
 
-/** PROCESSED, REJECTED e FAILED são estados finais: nunca mudam depois. */
-export type WagerStatus = 'PENDING' | 'PENDING_REFERENCE' | 'PROCESSED' | 'REJECTED' | 'FAILED';
+export type { WagerKind, WagerStatus };
 
 /** Uma linha da tabela `wager_transactions`. */
 export class WagerTransactionRecord {

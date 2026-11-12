@@ -10,7 +10,9 @@
     "test": "bun test",
     "migration:up": "bun --bun mikro-orm migration:up",
     "migration:down": "bun --bun mikro-orm migration:down",
-    "migration:list": "bun --bun mikro-orm migration:list"
+    "migration:list": "bun --bun mikro-orm migration:list",
+    "test:unit": "bun test src",
+    "test:integration": "bun test test/integration"
   },
   "dependencies": {
     "@mikro-orm/core": "^7.2.9",
