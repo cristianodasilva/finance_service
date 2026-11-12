@@ -8,6 +8,8 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import { config } from '../config';
+import { runWithLogContext } from '../observability/log-context';
+import { metrics } from '../observability/metrics';
 import { ProcessWagerService } from '../wagering/process-wager.service';
 import { parseWagerCommand } from '../wagering/wager-command.parser';
 import { classifyError } from './message-outcome';
@@ -101,13 +103,20 @@ export class WagerQueueConsumer implements OnApplicationBootstrap, OnApplication
     return Messages.length;
   }
 
-  private async handle(message: Message): Promise<void> {
+  private handle(message: Message): Promise<void> {
+    // Todos os logs desta mensagem levam o messageId como id de correlação.
+    const messageId = message.MessageId!;
+    return runWithLogContext({ correlationId: messageId, messageId }, () => this.handleInContext(message));
+  }
+
+  private async handleInContext(message: Message): Promise<void> {
     const messageId = message.MessageId!;
     try {
       const command = parseWagerCommand(JSON.parse(message.Body ?? ''));
       const { transaction, replayed } = await this.processWager.execute(command, { type: 'sqs', messageId });
       // Chegou aqui = COMMIT feito. Agora sim confirmamos (ack).
       await this.ack(message);
+      metrics.sqsMessages.inc({ outcome: replayed ? 'duplicate' : 'processed' });
       this.logger.log(
         `Message ${messageId} → ${transaction.status}${transaction.failureCode ? ` (${transaction.failureCode})` : ''}${replayed ? ' [duplicate]' : ''}`,
       );
@@ -115,9 +124,12 @@ export class WagerQueueConsumer implements OnApplicationBootstrap, OnApplication
       const { kind, code } = classifyError(error);
       if (kind === 'permanent') {
         await this.sendToDeadLetter(message, code, (error as Error).message);
+        metrics.sqsMessages.inc({ outcome: 'dead_lettered' });
+        metrics.deadLettered.inc({ reason: code });
         this.logger.warn(`Message ${messageId} sent to DLQ: ${code}`);
       } else {
         await this.retryLater(message);
+        metrics.sqsMessages.inc({ outcome: 'retried' });
         this.logger.warn(`Message ${messageId} will be retried: ${code}`);
       }
     }

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { newId } from '../common/ids';
+import { metrics } from '../observability/metrics';
 
 export interface Divergence {
   walletId: string;
@@ -30,8 +31,6 @@ export interface ReconciliationReport {
 @Injectable()
 export class ReconciliationService {
   private readonly logger = new Logger(ReconciliationService.name);
-  /** Contador simples de divergências (exposto como métrica na etapa de observabilidade). */
-  static divergencesDetected = 0;
 
   constructor(private readonly em: EntityManager) {}
 
@@ -69,7 +68,7 @@ export class ReconciliationService {
       }));
 
     for (const d of divergences) {
-      ReconciliationService.divergencesDetected++;
+      metrics.reconciliationDivergences.inc();
       // Log de ERRO: alguém precisa olhar. Só ids e valores agregados (nada sensível).
       this.logger.error(
         `Reconciliation divergence on wallet ${d.walletId}: stored=${d.storedBalance} (v${d.storedVersion}) ledger=${d.ledgerBalance} (v${d.ledgerVersion})`,

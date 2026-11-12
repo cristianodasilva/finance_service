@@ -24,6 +24,8 @@ import {
   WagerTransactionRejected,
   type WagerTransactionEventPayload,
 } from '../events/wager-transaction.events';
+import { enrichLogContext } from '../observability/log-context';
+import { metrics } from '../observability/metrics';
 import { addToOutbox } from '../outbox/outbox.writer';
 import { WalletMapper } from '../wallets/wallet.mapper';
 
@@ -66,19 +68,31 @@ export class ProcessWagerService {
    */
   async execute(command: WagerCommand, source: WagerSource): Promise<WagerResult> {
     const requestHash = hashCommand(command);
+    // Acrescenta ids de correlação aos logs deste pedido (nada de valores ou dados do jogador).
+    enrichLogContext({ walletId: command.walletId, providerTransactionId: command.providerTransactionId });
+    const stopTimer = metrics.processingDuration.startTimer({ source: source.type });
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         // Cada tentativa usa uma transação nova (e um EntityManager limpo).
-        return await this.em.fork().transactional((tx) => this.attempt(tx, command, source, requestHash));
+        const result = await this.em.fork().transactional((tx) => this.attempt(tx, command, source, requestHash));
+        stopTimer();
+        recordOutcome(result, source.type);
+        return result;
       } catch (error) {
-        if (!isRetryable(error)) throw error;
+        if (!isRetryable(error)) {
+          stopTimer();
+          throw error;
+        }
+        metrics.concurrencyConflicts.inc();
         this.logger.debug(
           `Concurrent modification on wallet ${command.walletId} (attempt ${attempt}/${MAX_ATTEMPTS}), retrying`,
         );
         await sleep(backoffMs(attempt));
       }
     }
+    stopTimer();
+    this.logger.error(`Gave up after ${MAX_ATTEMPTS} concurrency retries`);
     throw new TransientError(
       'CONCURRENCY_RETRIES_EXHAUSTED',
       `Gave up after ${MAX_ATTEMPTS} concurrent modification retries on wallet ${command.walletId}`,
@@ -198,6 +212,7 @@ export class ProcessWagerService {
           if (!locked) return null;
 
           const record = await tx.findOneOrFail(WagerTransactionRecord, { id: transactionId });
+          enrichLogContext({ transactionId, walletId: record.walletId, providerTransactionId: record.providerTransactionId });
           const wallet = WalletMapper.toDomain(await tx.findOneOrFail(WalletRecord, { id: record.walletId }));
           const balanceBefore = wallet.balance;
           const versionBefore = wallet.version;
@@ -231,6 +246,7 @@ export class ProcessWagerService {
         });
       } catch (error) {
         if (!isRetryable(error)) throw error;
+        metrics.concurrencyConflicts.inc();
         await sleep(backoffMs(attempt));
       }
     }
@@ -434,6 +450,18 @@ function hashCommand(c: WagerCommand): string {
     c.referenceProviderTransactionId,
   ]);
   return createHash('sha256').update(canonical).digest('hex');
+}
+
+/** Atualiza as métricas com o resultado final de um pedido. */
+function recordOutcome(result: WagerResult, source: WagerSource['type']): void {
+  const t = result.transaction;
+  enrichLogContext({ transactionId: t.id });
+  if (result.replayed) {
+    metrics.duplicates.inc({ source });
+    return;
+  }
+  metrics.transactions.inc({ kind: t.kind, status: t.status, source });
+  if (t.failureCode) metrics.failures.inc({ failure_code: t.failureCode });
 }
 
 /** Remonta o pedido original a partir da transação gravada (usado no reprocessamento). */

@@ -3,6 +3,7 @@ import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { config } from '../config';
 import { SQS_CLIENT } from '../messaging/sqs.client';
+import { metrics } from '../observability/metrics';
 import { PollingWorker } from './polling-worker';
 
 interface OutboxRow {
@@ -66,7 +67,9 @@ export class OutboxPublisherWorker extends PollingWorker {
             `update outbox_events set published_at = now(), attempts = attempts + 1, last_error = null where id = ?`,
             [row.id],
           );
+          metrics.outboxPublished.inc({ event_type: row.event_type });
         } catch (error) {
+          metrics.outboxPublishFailures.inc();
           // Falhou: registra o erro e agenda nova tentativa com espera crescente (até 5 min).
           const delaySeconds = Math.min(2 ** (row.attempts + 1), 300);
           await tx.execute(

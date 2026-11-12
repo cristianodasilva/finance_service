@@ -1,6 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { config } from '../config';
+import { newId } from '../common/ids';
+import { runWithLogContext } from '../observability/log-context';
+import { metrics } from '../observability/metrics';
 import { ProcessWagerService } from '../wagering/process-wager.service';
 import { PollingWorker } from './polling-worker';
 
@@ -34,11 +37,14 @@ export class PendingReferenceWorker extends PollingWorker {
 
     let handled = 0;
     for (const { id } of due) {
-      const status = await this.processWager.retryPendingReference(id, {
-        maxAttempts: config.pendingReference.maxAttempts,
-        backoffMs: (attempt) => Math.min(2_000 * 2 ** attempt, 5 * 60_000),
-      });
+      const status = await runWithLogContext({ correlationId: newId(), transactionId: id }, () =>
+        this.processWager.retryPendingReference(id, {
+          maxAttempts: config.pendingReference.maxAttempts,
+          backoffMs: (attempt) => Math.min(2_000 * 2 ** attempt, 5 * 60_000),
+        }),
+      );
       if (status === null) continue; // outro worker pegou antes
+      metrics.pendingReferenceRetries.inc({ result: status });
       handled++;
       if (status !== 'PENDING_REFERENCE') this.logger.log(`Pending transaction ${id} → ${status}`);
     }
