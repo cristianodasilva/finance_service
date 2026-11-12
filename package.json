@@ -7,7 +7,10 @@
     "start": "bun run src/main.ts",
     "dev": "bun --watch src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "migration:up": "bun --bun mikro-orm migration:up",
+    "migration:down": "bun --bun mikro-orm migration:down",
+    "migration:list": "bun --bun mikro-orm migration:list"
   },
   "dependencies": {
     "@mikro-orm/core": "^7.2.9",
@@ -26,5 +29,10 @@
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2"
+  },
+  "mikro-orm": {
+    "configPaths": [
+      "./src/database/mikro-orm.config.ts"
+    ]
   }
 }
