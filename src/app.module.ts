@@ -3,6 +3,7 @@ import { MikroOrmModule } from '@mikro-orm/nestjs';
 import ormConfig from './database/mikro-orm.config';
 import { HealthModule } from './health/health.module';
 import { MessagingModule } from './messaging/messaging.module';
+import { ReconciliationModule } from './reconciliation/reconciliation.module';
 import { WageringModule } from './wagering/wagering.module';
 import { WalletsModule } from './wallets/wallets.module';
 import { WorkersModule } from './workers/workers.module';
@@ -18,6 +19,7 @@ import { WorkersModule } from './workers/workers.module';
     WageringModule,
     MessagingModule,
     WorkersModule,
+    ReconciliationModule,
   ],
 })
 export class AppModule {}

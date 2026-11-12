@@ -10,6 +10,7 @@ import { Money } from '../domain/money/money';
 import { Wallet } from '../domain/wallet/wallet';
 import { WalletBalanceChanged } from '../events/wallet-balance-changed.event';
 import { addToOutbox } from '../outbox/outbox.writer';
+import { decodeCursor, encodeCursor } from './ledger-cursor';
 import { WalletMapper } from './wallet.mapper';
 
 export interface CreateWalletInput {
@@ -143,5 +144,60 @@ export class WalletsService {
       throw new DomainError(FailureCode.WALLET_NOT_FOUND, `Wallet ${id} not found`);
     }
     return WalletMapper.toDomain(record);
+  }
+
+  /** Busca as carteiras de um jogador (uma por moeda). */
+  async findByPlayer(playerId: string): Promise<Wallet[]> {
+    const records = await this.em.fork().find(WalletRecord, { playerId }, { orderBy: { currency: 'asc' } });
+    return records.map((r) => WalletMapper.toDomain(r));
+  }
+
+  /**
+   * Extrato da carteira, do movimento mais recente para o mais antigo, paginado por cursor.
+   * Pedimos `limit + 1` linhas: se vier a linha extra, sabemos que existe próxima página.
+   */
+  async ledger(walletId: string, params: { limit: number; cursor?: string }) {
+    await this.findById(walletId); // 404 se a carteira não existir
+    const before = params.cursor ? decodeCursor(params.cursor) : null;
+
+    const rows = await this.em.fork().execute<
+      {
+        id: string;
+        transaction_id: string;
+        direction: string;
+        amount: string;
+        balance_after: string;
+        wallet_version: number;
+        created_at: Date;
+        kind: string;
+        provider_transaction_id: string;
+      }[]
+    >(
+      `select l.id, l.transaction_id, l.direction, l.amount::text, l.balance_after::text,
+              l.wallet_version, l.created_at, t.kind, t.provider_transaction_id
+         from wallet_ledger_entries l
+         join wager_transactions t on t.id = l.transaction_id
+        where l.wallet_id = ? ${before !== null ? 'and l.wallet_version < ?' : ''}
+        order by l.wallet_version desc
+        limit ?`,
+      before !== null ? [walletId, before, params.limit + 1] : [walletId, params.limit + 1],
+    );
+
+    const hasMore = rows.length > params.limit;
+    const page = rows.slice(0, params.limit);
+    return {
+      items: page.map((r) => ({
+        id: r.id,
+        transactionId: r.transaction_id,
+        transactionKind: r.kind,
+        providerTransactionId: r.provider_transaction_id,
+        direction: r.direction,
+        amount: r.amount,
+        balanceAfter: r.balance_after,
+        walletVersion: r.wallet_version,
+        createdAt: new Date(r.created_at).toISOString(),
+      })),
+      nextCursor: hasMore ? encodeCursor(page[page.length - 1]!.wallet_version) : null,
+    };
   }
 }

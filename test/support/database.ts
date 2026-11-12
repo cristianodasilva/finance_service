@@ -45,7 +45,7 @@ export async function createInstances(count: number): Promise<MikroORM[]> {
 /** Apaga todos os dados entre os testes (TRUNCATE não dispara as triggers de linha do extrato). */
 export async function resetDatabase(orm: MikroORM): Promise<void> {
   await orm.em.execute(
-    `truncate table outbox_events, inbox_messages, idempotency_keys,
+    `truncate table reconciliation_divergences, outbox_events, inbox_messages, idempotency_keys,
        wallet_ledger_entries, wager_transactions, wallets restart identity cascade`,
   );
 }

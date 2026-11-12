@@ -1,4 +1,5 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
+import { DomainError, FailureCode } from '../domain/errors';
 import { requireObject, requireString, requireUuid } from '../common/validation';
 import { WalletMapper, type WalletResponse } from './wallet.mapper';
 import { WalletsService } from './wallets.service';
@@ -32,5 +33,23 @@ export class WalletsController {
   async findOne(@Param('id') id: string): Promise<WalletResponse> {
     const wallet = await this.wallets.findById(requireUuid(id));
     return WalletMapper.toResponse(wallet);
+  }
+
+  /** GET /wallets?playerId=X — carteiras de um jogador. */
+  @Get()
+  async findByPlayer(@Query('playerId') playerId?: string): Promise<WalletResponse[]> {
+    if (!playerId) throw new DomainError(FailureCode.INVALID_REQUEST, 'Query param "playerId" is required');
+    const wallets = await this.wallets.findByPlayer(playerId);
+    return wallets.map((w) => WalletMapper.toResponse(w));
+  }
+
+  /** GET /wallets/:id/ledger?limit=50&cursor=... — extrato paginado. */
+  @Get(':id/ledger')
+  async ledger(@Param('id') id: string, @Query('limit') limit?: string, @Query('cursor') cursor?: string) {
+    const parsedLimit = limit === undefined ? 50 : Number(limit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 200) {
+      throw new DomainError(FailureCode.INVALID_REQUEST, '"limit" must be an integer between 1 and 200');
+    }
+    return this.wallets.ledger(requireUuid(id), { limit: parsedLimit, cursor });
   }
 }
