@@ -2,7 +2,7 @@
   "name": "finance_service",
   "version": "0.1.0",
   "private": true,
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "bun run src/main.ts",
     "dev": "bun --watch src/main.ts",
@@ -10,6 +10,10 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@mikro-orm/core": "^7.2.9",
+    "@mikro-orm/migrations": "^7.2.9",
+    "@mikro-orm/nestjs": "^7.1.0",
+    "@mikro-orm/postgresql": "^7.2.9",
     "@nestjs/common": "^12.4.2",
     "@nestjs/core": "^12.4.2",
     "@nestjs/platform-express": "^12.4.2",
@@ -17,6 +21,7 @@
     "rxjs": "^7.8.2"
   },
   "devDependencies": {
+    "@mikro-orm/cli": "^7.2.9",
     "@types/bun": "^1.4.4",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
