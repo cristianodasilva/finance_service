@@ -2,6 +2,7 @@ import { DomainError, FailureCode } from '../errors';
 import { Currency } from '../money/currency';
 import { Money } from '../money/money';
 
+/** Dados necessários para montar uma carteira. */
 export interface WalletProps {
   id: string;
   playerId: string;
@@ -12,21 +13,23 @@ export interface WalletProps {
 }
 
 /**
- * Wallet aggregate: one per (player, currency).
+ * Carteira (wallet): existe uma por jogador + moeda.
  *
- * Invariants:
- *  - balance is never negative;
- *  - balance currency always equals the wallet currency;
- *  - `version` increments only when the balance actually changes
- *    (used for optimistic concurrency control at the database level).
+ * Regras que esta classe garante (invariantes = regras sempre verdadeiras):
+ *  - o saldo nunca fica negativo;
+ *  - o saldo está sempre na mesma moeda da carteira;
+ *  - `version` só aumenta quando o saldo realmente muda.
+ *    (A versão será usada no banco para detectar alterações simultâneas.)
  *
- * This class is persistence-agnostic; database mapping lives elsewhere.
+ * Esta classe não sabe nada de banco de dados. O mapeamento para tabela fica em outro lugar.
  */
 export class Wallet {
   readonly id: string;
   readonly playerId: string;
   readonly currency: Currency;
   readonly createdAt: Date;
+
+  // "_" + private: só a própria classe altera. De fora, só leitura (pelos getters abaixo).
   private _balance: Money;
   private _version: number;
 
@@ -45,7 +48,11 @@ export class Wallet {
     this._version = props.version;
   }
 
-  /** Creates a brand-new wallet with zero balance. Opening credits are applied via `credit`. */
+  /**
+   * Abre uma carteira NOVA, com saldo zero.
+   * Se houver saldo inicial, ele entra depois via `credit` (transação OPENING),
+   * para que também fique registrado no extrato (ledger).
+   */
   static open(params: { id: string; playerId: string; currency: Currency; now?: Date }): Wallet {
     return new Wallet({
       id: params.id,
@@ -57,7 +64,7 @@ export class Wallet {
     });
   }
 
-  /** Rebuilds a wallet from persisted state. */
+  /** Remonta uma carteira que já existe, a partir dos dados lidos do banco. */
   static restore(props: WalletProps): Wallet {
     return new Wallet(props);
   }
@@ -70,13 +77,13 @@ export class Wallet {
     return this._version;
   }
 
-  /** Adds funds (WIN, REFUND, OPENING, reversal of a BET). */
+  /** Adiciona dinheiro (WIN, REFUND, OPENING, ou estorno de uma BET). */
   credit(amount: Money): void {
     this.assertValidAmount(amount);
     this.applyDelta(amount);
   }
 
-  /** Removes funds for a BET. Fails with INSUFFICIENT_FUNDS if it would overdraw. */
+  /** Retira dinheiro para uma aposta (BET). Falha com INSUFFICIENT_FUNDS se não houver saldo. */
   debit(amount: Money): void {
     this.assertValidAmount(amount);
     if (this._balance.lessThan(amount)) {
@@ -89,9 +96,11 @@ export class Wallet {
   }
 
   /**
-   * Removes funds to reverse a previous credit (ROLLBACK of WIN/REFUND).
-   * Distinct failure code from a BET with insufficient funds: the money was
-   * already granted and spent, which usually needs operational follow-up.
+   * Retira dinheiro para desfazer um crédito anterior (ROLLBACK de um WIN/REFUND).
+   *
+   * Usa um código de erro DIFERENTE do `debit`: aqui o prêmio já foi pago
+   * e o jogador já gastou. Não é "aposta sem saldo"; é um caso que
+   * normalmente precisa de atenção da equipe de operações.
    */
   reverseCredit(amount: Money): void {
     this.assertValidAmount(amount);
@@ -104,12 +113,14 @@ export class Wallet {
     this.applyDelta(amount.negate());
   }
 
+  /** Aplica a variação (delta) no saldo e incrementa a versão. */
   private applyDelta(delta: Money): void {
-    if (delta.isZero()) return; // no balance change → no version bump
+    if (delta.isZero()) return; // saldo não mudou → versão não muda
     this._balance = this._balance.add(delta);
     this._version += 1;
   }
 
+  /** O valor precisa ser da mesma moeda e maior que zero. */
   private assertValidAmount(amount: Money): void {
     if (!amount.currency.equals(this.currency)) {
       throw new DomainError(

@@ -9,7 +9,7 @@ export class HealthController {
 
   @Get('ready')
   ready(): { status: string } {
-    // TODO: check PostgreSQL and SQS connectivity once they are wired in.
+    // A FAZER: verificar conexão com PostgreSQL e SQS quando estiverem configurados.
     return { status: 'ok' };
   }
 }

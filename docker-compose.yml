@@ -22,7 +22,7 @@ services:
     ports:
       - "4566:4566"
 
-  # One-shot job that creates the SQS queues (main FIFO + DLQ with redrive policy).
+  # Container que roda uma única vez: cria as filas SQS (principal + DLQ) e encerra.
   aws-init:
     image: amazon/aws-cli:2.27.50
     depends_on:

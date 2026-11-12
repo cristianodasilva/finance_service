@@ -18,20 +18,20 @@ function codeOf(fn: () => unknown): FailureCode | undefined {
 }
 
 describe('Wallet', () => {
-  test('opens with zero balance and version 0', () => {
+  test('abre com saldo zero e versão 0', () => {
     const w = newWallet();
     expect(w.balance.toDecimal()).toBe('0.00');
     expect(w.version).toBe(0);
   });
 
-  test('credit increases balance and bumps version', () => {
+  test('crédito aumenta o saldo e incrementa a versão', () => {
     const w = newWallet();
     w.credit(brl('100.00'));
     expect(w.balance.toDecimal()).toBe('100.00');
     expect(w.version).toBe(1);
   });
 
-  test('debit decreases balance and bumps version', () => {
+  test('débito diminui o saldo e incrementa a versão', () => {
     const w = newWallet();
     w.credit(brl('100.00'));
     w.debit(brl('80.00'));
@@ -39,14 +39,14 @@ describe('Wallet', () => {
     expect(w.version).toBe(2);
   });
 
-  test('debit of the exact balance leaves zero', () => {
+  test('débito do saldo exato deixa zero', () => {
     const w = newWallet();
     w.credit(brl('50.00'));
     w.debit(brl('50.00'));
     expect(w.balance.isZero()).toBe(true);
   });
 
-  test('second 80.00 debit on 100.00 fails with INSUFFICIENT_FUNDS and changes nothing', () => {
+  test('segundo débito de 80.00 sobre 100.00 falha com INSUFFICIENT_FUNDS e não altera nada', () => {
     const w = newWallet();
     w.credit(brl('100.00'));
     w.debit(brl('80.00'));
@@ -56,29 +56,29 @@ describe('Wallet', () => {
     expect(w.version).toBe(versionBefore);
   });
 
-  test('reversing a spent credit fails with REVERSAL_WOULD_OVERDRAW (distinct code)', () => {
+  test('estornar um crédito já gasto falha com REVERSAL_WOULD_OVERDRAW (código diferente)', () => {
     const w = newWallet();
-    w.credit(brl('50.00')); // e.g. a WIN
-    w.debit(brl('40.00')); // player spent it
+    w.credit(brl('50.00')); // ex.: um prêmio (WIN)
+    w.debit(brl('40.00')); // jogador gastou o prêmio
     expect(codeOf(() => w.reverseCredit(brl('50.00')))).toBe(FailureCode.REVERSAL_WOULD_OVERDRAW);
     expect(w.balance.toDecimal()).toBe('10.00');
   });
 
-  test('reverseCredit succeeds when balance is enough', () => {
+  test('estorno funciona quando há saldo suficiente', () => {
     const w = newWallet();
     w.credit(brl('50.00'));
     w.reverseCredit(brl('50.00'));
     expect(w.balance.isZero()).toBe(true);
   });
 
-  test.each(['0.00', '-1.00'])('rejects non-positive amount %s', (v) => {
+  test.each(['0.00', '-1.00'])('rejeita valor não positivo %s', (v) => {
     const w = newWallet();
     expect(codeOf(() => w.credit(brl(v)))).toBe(FailureCode.INVALID_AMOUNT);
     expect(codeOf(() => w.debit(brl(v)))).toBe(FailureCode.INVALID_AMOUNT);
     expect(w.version).toBe(0);
   });
 
-  test('cannot be restored with a negative balance', () => {
+  test('não pode ser remontada com saldo negativo', () => {
     expect(
       codeOf(() =>
         Wallet.restore({

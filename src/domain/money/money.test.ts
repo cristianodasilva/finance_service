@@ -18,7 +18,7 @@ function expectCode(fn: () => unknown, code: FailureCode) {
 }
 
 describe('Money', () => {
-  test('0.10 + 0.20 is exactly 0.30 (no floating point error)', () => {
+  test('0.10 + 0.20 é exatamente 0.30 (sem erro de ponto flutuante)', () => {
     expect(brl('0.10').add(brl('0.20')).equals(brl('0.30'))).toBe(true);
     expect(brl('0.1').add(brl('0.2')).toDecimal()).toBe('0.30');
   });
@@ -30,34 +30,34 @@ describe('Money', () => {
     ['0', '0.00', 0n],
     ['-12.34', '-12.34', -1234n],
     ['007.10', '7.10', 710n],
-  ])('parses "%s" as %s', (input, formatted, minor) => {
+  ])('converte "%s" em %s', (input, formatted, minor) => {
     const m = brl(input);
     expect(m.toDecimal()).toBe(formatted);
     expect(m.minor).toBe(minor);
   });
 
-  test('handles amounts far beyond Number.MAX_SAFE_INTEGER', () => {
+  test('suporta valores muito maiores que Number.MAX_SAFE_INTEGER', () => {
     const big = brl('99999999999999999999.99');
     expect(big.add(brl('0.01')).toDecimal()).toBe('100000000000000000000.00');
   });
 
   test.each(['1.234', '1e3', ' 1.00', '1.', '.5', 'abc', '', '1,00', '+1'])(
-    'rejects invalid input "%s"',
+    'rejeita entrada inválida "%s"',
     (input) => expectCode(() => brl(input), FailureCode.INVALID_AMOUNT),
   );
 
-  test('rejects non-string input such as a JS number', () => {
+  test('rejeita entrada que não é string (ex.: um number do JS)', () => {
     expectCode(() => Money.fromDecimal(10.5 as unknown as string, BRL), FailureCode.INVALID_AMOUNT);
   });
 
-  test('subtracts and compares', () => {
+  test('subtrai e compara', () => {
     expect(brl('100.00').subtract(brl('80.00')).toDecimal()).toBe('20.00');
     expect(brl('20.00').subtract(brl('80.00')).isNegative()).toBe(true);
     expect(brl('80.00').greaterThan(brl('20.00'))).toBe(true);
     expect(brl('20.00').lessThan(brl('80.00'))).toBe(true);
   });
 
-  test('is immutable', () => {
+  test('é imutável', () => {
     const a = brl('10.00');
     const b = a.add(brl('5.00'));
     expect(a.toDecimal()).toBe('10.00');
@@ -68,11 +68,11 @@ describe('Money', () => {
     }).toThrow();
   });
 
-  test('serializes to JSON as decimal string', () => {
+  test('vira JSON com o valor em texto decimal', () => {
     expect(JSON.stringify(brl('10.5'))).toBe('{"amount":"10.50","currency":"BRL"}');
   });
 
-  test('rejects unsupported currencies', () => {
+  test('rejeita moedas não suportadas', () => {
     expectCode(() => Currency.of('USD'), FailureCode.UNSUPPORTED_CURRENCY);
     expect(Currency.of('BRL')).toBe(BRL);
   });
