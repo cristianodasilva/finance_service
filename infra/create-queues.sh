@@ -26,5 +26,9 @@ cat > /tmp/main-attrs.json <<JSON
 JSON
 aws_sqs create-queue --queue-name wager-transactions.fifo --attributes file:///tmp/main-attrs.json >/dev/null
 
+# 3) Fila de EVENTOS publicados pelo serviço (via outbox). Grupo = entidade (ex.: a carteira).
+aws_sqs create-queue --queue-name wager-events.fifo \
+  --attributes FifoQueue=true,ContentBasedDeduplication=false >/dev/null
+
 echo "Queues ready:"
 aws_sqs list-queues --output text

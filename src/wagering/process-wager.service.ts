@@ -11,7 +11,9 @@ import { LedgerEntryRecord } from '../database/entities/ledger-entry.record';
 import { WagerTransactionRecord } from '../database/entities/wager-transaction.record';
 import { WalletRecord } from '../database/entities/wallet.record';
 import { DomainError, FailureCode } from '../domain/errors';
+import type { Currency } from '../domain/money/currency';
 import { Money } from '../domain/money/money';
+import type { Wallet } from '../domain/wallet/wallet';
 import { requiresReference } from '../domain/wager/wager-kind';
 import { decideWager, type ReferenceSnapshot, type WagerCommand, type WagerDecision } from '../domain/wager/wager-rules';
 import type { DomainEvent } from '../events/domain-event';
@@ -162,11 +164,100 @@ export class ProcessWagerService {
     await tx.flush(); // grava já, porque o extrato e as chaves apontam para esta linha
 
     // ------------------------------------------------------------------
-    // PASSO 6 — Se o saldo mudou: UPDATE condicional na versão + linha no extrato.
+    // PASSOS 6 e 7 — Saldo, extrato e eventos (ver applyDecision).
     // ------------------------------------------------------------------
-    const events: DomainEvent[] = [];
+    await this.applyDecision(tx, { record, wallet, balanceBefore, versionBefore, decision, now });
+    await this.linkDeduplicationKey(tx, source, record.id);
+
+    return { transaction: record, replayed: false };
+    // Ao sair daqui sem erro, o MikroORM faz o flush final e o COMMIT.
+  }
+
+  /**
+   * Tenta de novo UMA transação que estava aguardando referência (PENDING_REFERENCE).
+   * Chamado pelo worker. Usa as MESMAS regras (decideWager) e o MESMO applyDecision.
+   *
+   * Devolve o novo status, ou null se a transação já não estava pendente
+   * (outro worker pegou antes, ou ainda não chegou a hora).
+   */
+  async retryPendingReference(
+    transactionId: string,
+    policy: { maxAttempts: number; backoffMs: (attempt: number) => number },
+  ): Promise<string | null> {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this.em.fork().transactional(async (tx) => {
+          // FOR UPDATE SKIP LOCKED: trava ESTA linha para nós. Se outro worker já a travou,
+          // pulamos (não esperamos) → dois workers nunca processam a mesma transação.
+          const [locked] = await tx.execute<{ id: string }[]>(
+            `select id from wager_transactions
+             where id = ? and status = 'PENDING_REFERENCE' and next_attempt_at <= now()
+             for update skip locked`,
+            [transactionId],
+          );
+          if (!locked) return null;
+
+          const record = await tx.findOneOrFail(WagerTransactionRecord, { id: transactionId });
+          const wallet = WalletMapper.toDomain(await tx.findOneOrFail(WalletRecord, { id: record.walletId }));
+          const balanceBefore = wallet.balance;
+          const versionBefore = wallet.version;
+          const command = commandFromRecord(record, wallet.currency);
+          const reference = await this.loadReference(tx, command);
+
+          let decision = decideWager({ command, wallet, reference });
+          const now = new Date();
+          record.attempts += 1;
+          record.updatedAt = now;
+
+          if (decision.status === 'PENDING_REFERENCE') {
+            if (record.attempts >= policy.maxAttempts) {
+              // Esperamos o suficiente: a referência não vai chegar → rejeita.
+              decision = { status: 'REJECTED', failureCode: FailureCode.REFERENCE_NOT_FOUND };
+            } else {
+              record.nextAttemptAt = new Date(now.getTime() + policy.backoffMs(record.attempts));
+              return record.status; // continua pendente; o flush grava attempts/nextAttemptAt
+            }
+          }
+
+          record.status = decision.status;
+          record.failureCode = decision.status === 'REJECTED' ? decision.failureCode : null;
+          record.referencedTransactionId = reference?.id ?? null;
+          record.nextAttemptAt = null;
+          record.processedAt = now;
+          await tx.flush();
+
+          await this.applyDecision(tx, { record, wallet, balanceBefore, versionBefore, decision, now });
+          return record.status;
+        });
+      } catch (error) {
+        if (!isRetryable(error)) throw error;
+        await sleep(backoffMs(attempt));
+      }
+    }
+    throw new TransientError('CONCURRENCY_RETRIES_EXHAUSTED', `Gave up retrying pending transaction ${transactionId}`);
+  }
+
+  /**
+   * Aplica uma decisão já tomada:
+   *  - se o saldo mudou: UPDATE condicional na versão + linha no extrato + evento WalletBalanceChanged;
+   *  - sempre: evento da transação (Processed / Rejected / PendingReference) na outbox.
+   */
+  private async applyDecision(
+    tx: EntityManager,
+    p: {
+      record: WagerTransactionRecord;
+      wallet: Wallet;
+      balanceBefore: Money;
+      versionBefore: number;
+      decision: WagerDecision;
+      now: Date;
+    },
+  ): Promise<void> {
+    const { record, wallet, decision, now } = p;
+    const events: DomainEvent[] = [transactionEvent(record, decision, now)];
+
     if (decision.status === 'PROCESSED' && decision.movement) {
-      await this.saveWalletBalance(tx, wallet.id, versionBefore, wallet.balance, wallet.version, now);
+      await this.saveWalletBalance(tx, wallet.id, p.versionBefore, wallet.balance, wallet.version, now);
 
       tx.persist(
         tx.create(LedgerEntryRecord, {
@@ -186,7 +277,7 @@ export class ProcessWagerService {
             walletId: wallet.id,
             playerId: wallet.playerId,
             currency: wallet.currency.code,
-            previousBalance: balanceBefore.toDecimal(),
+            previousBalance: p.balanceBefore.toDecimal(),
             newBalance: wallet.balance.toDecimal(),
             walletVersion: wallet.version,
             transactionId: record.id,
@@ -195,16 +286,7 @@ export class ProcessWagerService {
         ),
       );
     }
-
-    // ------------------------------------------------------------------
-    // PASSO 7 — Eventos na outbox (mesma transação) e vínculo da chave.
-    // ------------------------------------------------------------------
-    events.unshift(transactionEvent(record, decision, now));
     addToOutbox(tx, events);
-    await this.linkDeduplicationKey(tx, source, record.id);
-
-    return { transaction: record, replayed: false };
-    // Ao sair daqui sem erro, o MikroORM faz o flush final e o COMMIT.
   }
 
   /**
@@ -352,6 +434,20 @@ function hashCommand(c: WagerCommand): string {
     c.referenceProviderTransactionId,
   ]);
   return createHash('sha256').update(canonical).digest('hex');
+}
+
+/** Remonta o pedido original a partir da transação gravada (usado no reprocessamento). */
+function commandFromRecord(r: WagerTransactionRecord, currency: Currency): WagerCommand {
+  return {
+    provider: r.provider,
+    providerTransactionId: r.providerTransactionId,
+    kind: r.kind,
+    playerId: r.playerId,
+    walletId: r.walletId,
+    amount: Money.fromDecimal(r.amount, currency),
+    roundId: r.roundId ?? null,
+    referenceProviderTransactionId: r.referenceProviderTransactionId ?? null,
+  };
 }
 
 /** A transação já gravada tem o mesmo conteúdo do pedido novo? */
