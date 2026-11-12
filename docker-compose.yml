@@ -35,5 +35,66 @@ services:
       - ./infra/create-queues.sh:/create-queues.sh:ro
     entrypoint: ["/bin/sh", "/create-queues.sh"]
 
+  # Roda as migrations UMA vez antes de subir as instâncias.
+  migrate:
+    build: .
+    command: ["bun", "--bun", "mikro-orm", "migration:up"]
+    environment: &app-env
+      DATABASE_URL: postgresql://finance:finance@postgres:5432/finance
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://aws:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      SQS_WAGER_QUEUE_URL: http://aws:4566/000000000000/wager-transactions.fifo
+      SQS_WAGER_DLQ_URL: http://aws:4566/000000000000/wager-transactions-dlq.fifo
+      SQS_EVENTS_QUEUE_URL: http://aws:4566/000000000000/wager-events.fifo
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # 3 instâncias IDÊNTICAS da aplicação (API + consumidor + workers em cada uma).
+  app-1: &app
+    build: .
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      aws-init:
+        condition: service_completed_successfully
+    ports:
+      - "3001:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # Tempo para o desligamento gracioso antes do Docker forçar (SIGKILL).
+    stop_grace_period: 30s
+
+  app-2:
+    <<: *app
+    ports:
+      - "3002:3000"
+
+  app-3:
+    <<: *app
+    ports:
+      - "3003:3000"
+
+  # Ponto de entrada único: http://localhost:3000 → balanceia entre app-1, app-2 e app-3.
+  lb:
+    image: nginx:1.30.6-alpine-slim
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "3000:80"
+    depends_on:
+      app-1:
+        condition: service_healthy
+      app-2:
+        condition: service_healthy
+      app-3:
+        condition: service_healthy
+
 volumes:
   pgdata:
