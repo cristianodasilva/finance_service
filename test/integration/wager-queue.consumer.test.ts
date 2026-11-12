@@ -31,13 +31,20 @@ beforeEach(async () => {
   await sqs.send(new PurgeQueueCommand({ QueueUrl: config.sqs.wagerDlqUrl })).catch(() => undefined);
 });
 
+/**
+ * O SQS FIFO descarta mensagens com o mesmo MessageDeduplicationId por 5 minutos.
+ * Por isso cada execução dos testes usa um prefixo único (senão, rodar de novo
+ * em menos de 5 minutos faria as mensagens "sumirem").
+ */
+const RUN_ID = crypto.randomUUID();
+
 async function send(body: unknown, dedupId: string): Promise<string> {
   const r = await sqs.send(
     new SendMessageCommand({
       QueueUrl: config.sqs.wagerQueueUrl,
       MessageBody: typeof body === 'string' ? body : JSON.stringify(body),
       MessageGroupId: 'group-1',
-      MessageDeduplicationId: dedupId,
+      MessageDeduplicationId: `${RUN_ID}:${dedupId}`,
     }),
   );
   return r.MessageId!;
