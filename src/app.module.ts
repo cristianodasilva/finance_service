@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import ormConfig from './database/mikro-orm.config';
 import { HealthModule } from './health/health.module';
+import { MessagingModule } from './messaging/messaging.module';
 import { WageringModule } from './wagering/wagering.module';
 import { WalletsModule } from './wallets/wallets.module';
 
@@ -14,6 +15,7 @@ import { WalletsModule } from './wallets/wallets.module';
     HealthModule,
     WalletsModule,
     WageringModule,
+    MessagingModule,
   ],
 })
 export class AppModule {}
