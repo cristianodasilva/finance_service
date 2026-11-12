@@ -1,0 +1,3 @@
+[test]
+# Prepara o ambiente de testes (filas separadas) antes de qualquer arquivo de teste.
+preload = ["./test/support/env.ts"]

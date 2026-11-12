@@ -6,6 +6,7 @@
       "name": "finance_service",
       "dependencies": {
         "@aws-sdk/client-sqs": "^3.1167.0",
+        "@mikro-orm/cli": "7.2.9",
         "@mikro-orm/core": "^7.2.9",
         "@mikro-orm/migrations": "^7.2.9",
         "@mikro-orm/nestjs": "^7.1.0",
@@ -18,7 +19,6 @@
         "rxjs": "^7.8.2",
       },
       "devDependencies": {
-        "@mikro-orm/cli": "^7.2.9",
         "@types/bun": "^1.4.4",
         "@types/express": "^5.0.6",
         "@types/node": "^26.6.6",
