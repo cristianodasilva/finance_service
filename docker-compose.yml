@@ -1,0 +1,39 @@
+name: finance_service
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: finance
+      POSTGRES_PASSWORD: finance
+      POSTGRES_DB: finance
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance -d finance"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  aws:
+    image: ministackorg/ministack:1.5.38
+    ports:
+      - "4566:4566"
+
+  # One-shot job that creates the SQS queues (main FIFO + DLQ with redrive policy).
+  aws-init:
+    image: amazon/aws-cli:2.27.50
+    depends_on:
+      - aws
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./infra/create-queues.sh:/create-queues.sh:ro
+    entrypoint: ["/bin/sh", "/create-queues.sh"]
+
+volumes:
+  pgdata:
