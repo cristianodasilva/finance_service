@@ -41,7 +41,7 @@ describe('Money', () => {
     expect(big.add(brl('0.01')).toDecimal()).toBe('100000000000000000000.00');
   });
 
-  test.each(['1.234', '1e3', ' 1.00', '1.', '.5', 'abc', '', '1,00', '+1'])(
+  test.each(['1.234', '10.999', '1e3', ' 1.00', '1.', '.5', 'abc', '', '1,00', '+1'])(
     'rejeita entrada inválida "%s"',
     (input) => expectCode(() => brl(input), FailureCode.INVALID_AMOUNT),
   );
