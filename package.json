@@ -12,7 +12,8 @@
     "migration:down": "bun --bun mikro-orm migration:down",
     "migration:list": "bun --bun mikro-orm migration:list",
     "test:unit": "bun test src",
-    "test:integration": "bun test test/integration"
+    "test:integration": "bun test test/integration",
+    "test:load": "bun scripts/load-test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1167.0",

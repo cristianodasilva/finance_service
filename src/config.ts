@@ -36,7 +36,7 @@ export const config = {
     publisherEnabled: bool(process.env.OUTBOX_PUBLISHER_ENABLED, true),
     /** De quanto em quanto tempo procura eventos novos (ms). */
     pollIntervalMs: Number(process.env.OUTBOX_POLL_INTERVAL_MS ?? 500),
-    batchSize: Number(process.env.OUTBOX_BATCH_SIZE ?? 50),
+    batchSize: Number(process.env.OUTBOX_BATCH_SIZE ?? 100),
   },
 
   pendingReference: {

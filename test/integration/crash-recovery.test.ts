@@ -85,7 +85,7 @@ describe('Crash depois do commit', () => {
     const mine = (e: { data: Record<string, unknown> }) => e.data.walletId === w;
 
     // Instância A trava as linhas (FOR UPDATE) e "morre" sem publicar.
-    const stuck = new OutboxPublisherWorker(a.em, sabotage('SendMessageCommand', 'hang'));
+    const stuck = new OutboxPublisherWorker(a.em, sabotage('SendMessageBatchCommand', 'hang'));
     void stuck.runOnce().catch(() => undefined);
     await Bun.sleep(300);
     // Morte do processo = a conexão dele cai. O PostgreSQL desfaz a transação e solta os locks.
@@ -104,7 +104,7 @@ describe('Crash depois do commit', () => {
 
     // Reenvio: publicado mas "morre" antes de marcar → enviado de novo com o MESMO eventId.
     await b.em.fork().execute(`update outbox_events set published_at = null`);
-    const flaky = new OutboxPublisherWorker(b.em, sabotage('SendMessageCommand', 'after'));
+    const flaky = new OutboxPublisherWorker(b.em, sabotage('SendMessageBatchCommand', 'after'));
     await flaky.runOnce();
     await b.em.fork().execute(`update outbox_events set next_attempt_at = now()`);
     while ((await flaky.runOnce()) > 0);
