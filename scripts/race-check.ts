@@ -1,70 +1,57 @@
 /**
  * Verificação de concorrência contra o sistema RODANDO (docker compose up).
- *
- * Dispara apostas simultâneas pelo balanceador (que distribui entre as 3 instâncias)
- * e confere as regras: nenhuma aposta além do saldo, saldo == extrato.
+ * Dispara apostas simultâneas pelo balanceador (3 instâncias) e confere as regras.
  *
  * Uso:  bun scripts/race-check.ts [url]      (padrão: http://localhost:3000)
  */
 const BASE = process.argv[2] ?? 'http://localhost:3000';
 const run = crypto.randomUUID().slice(0, 8);
 
-async function post(path: string, body: unknown, headers: Record<string, string> = {}) {
+async function call(method: string, path: string, body?: unknown, headers: Record<string, string> = {}) {
   const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
+    method,
     headers: { 'content-type': 'application/json', ...headers },
-    body: JSON.stringify(body),
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   return { status: res.status, upstream: res.headers.get('x-upstream'), body: (await res.json()) as any };
 }
 
-async function scenario(name: string, opening: string, bets: number, amount: string) {
+async function scenario(name: string, opening: string, bets: number, amount: string, sameKey = false) {
   const playerId = `race-${run}-${name}`;
-  const wallet = (await post('/wallets', { playerId, currency: 'BRL', initialBalance: opening })).body;
-
-  // Todas as apostas disparadas AO MESMO TEMPO.
+  const wallet = (await call('POST', '/wallets', { playerId, initialBalance: { amount: opening, currency: 'BRL' } })).body;
   const results = await Promise.all(
-    Array.from({ length: bets }, (_, i) =>
-      post(
+    Array.from({ length: bets }, (_, i) => {
+      const externalTransactionId = sameKey ? `${playerId}-bet` : `${playerId}-bet-${i}`;
+      return call(
+        'POST',
         '/wagering/transactions',
-        { provider: 'race', providerTransactionId: `${playerId}-bet-${i}`, kind: 'BET', playerId, walletId: wallet.id, currency: 'BRL', amount },
-        { 'Idempotency-Key': `${playerId}-key-${i}` },
-      ),
-    ),
+        {
+          providerId: 'race', externalTransactionId, playerId, walletId: wallet.id,
+          roundId: 'round-1', gameId: 'race-game', kind: 'BET', money: { amount, currency: 'BRL' },
+        },
+        { 'Idempotency-Key': `race:${externalTransactionId}` },
+      );
+    }),
   );
+  const n = (s: number) => results.filter((r) => r.status === s).length;
+  const recon = (await call('POST', `/wallets/${wallet.id}/reconciliation`)).body;
+  const replays = results.filter((r) => r.body.idempotentReplay === true).length;
 
-  const count = (s: number) => results.filter((r) => r.status === s).length;
-  const instances = new Set(results.map((r) => r.upstream));
-  const final = (await (await fetch(`${BASE}/wallets/${wallet.id}`)).json()) as any;
-
-  let ledgerTotal = 0n;
-  let debits = 0;
-  for (let cursor: string | null = null, first = true; first || cursor; first = false) {
-    const page = (await (await fetch(`${BASE}/wallets/${wallet.id}/ledger?limit=200${cursor ? `&cursor=${cursor}` : ''}`)).json()) as any;
-    for (const e of page.items) {
-      const cents = BigInt(e.amount.replace('.', ''));
-      ledgerTotal += e.direction === 'CREDIT' ? cents : -cents;
-      if (e.direction === 'DEBIT') debits++;
-    }
-    cursor = page.nextCursor;
-  }
-  const ledgerBalance = `${ledgerTotal / 100n}.${(ledgerTotal % 100n).toString().padStart(2, '0')}`;
-
-  console.log(`\n▶ ${name}: saldo inicial ${opening}, ${bets} BETs simultâneas de ${amount}`);
-  console.log(`  instâncias que atenderam: ${[...instances].join(', ')}`);
-  console.log(`  201 PROCESSED: ${count(201)}   422 REJECTED: ${count(422)}   outros: ${bets - count(201) - count(422)}`);
-  console.log(`  saldo final: ${final.balance}   saldo pelo extrato: ${ledgerBalance}   débitos no extrato: ${debits}`);
-  return { processed: count(201), balance: final.balance, ledgerBalance, debits };
+  console.log(`\n▶ ${name}: saldo inicial ${opening}, ${bets} BETs simultâneas de ${amount}${sameKey ? ' (MESMA aposta)' : ''}`);
+  console.log(`  instâncias que atenderam: ${[...new Set(results.map((r) => r.upstream))].join(', ')}`);
+  console.log(`  201: ${n(201)}   422: ${n(422)}   replays: ${replays}   outros: ${bets - n(201) - n(422)}`);
+  console.log(`  saldo: ${recon.storedBalance.amount}   pelo extrato: ${recon.calculatedBalance.amount}   lançamentos: ${recon.checkedEntries}   consistente: ${recon.consistent}`);
+  return { n201: n(201), replays, balance: recon.storedBalance.amount, entries: recon.checkedEntries, consistent: recon.consistent };
 }
 
 const a = await scenario('obrigatorio', '100.00', 2, '80.00');
 const b = await scenario('carga', '100.00', 60, '10.00');
+const c = await scenario('mesma-aposta-50x', '100.00', 50, '30.00', true);
 
 const ok =
-  a.processed === 1 && a.balance === '20.00' && a.debits === 1 && a.ledgerBalance === a.balance &&
-  b.processed === 10 && b.balance === '0.00' && b.debits === 10 && b.ledgerBalance === b.balance;
+  a.n201 === 1 && a.balance === '20.00' && a.entries === 2 && a.consistent &&
+  b.n201 === 10 && b.balance === '0.00' && b.entries === 11 && b.consistent &&
+  c.n201 === 50 && c.replays === 49 && c.balance === '70.00' && c.entries === 2 && c.consistent;
 
-const recon = (await post('/reconciliation/runs', {})).body;
-console.log(`\n▶ reconciliação: ${recon.checkedWallets} carteiras conferidas, ${recon.divergences.length} divergências`);
-console.log(ok && recon.divergences.length === 0 ? '\n✅ TODAS AS VERIFICAÇÕES PASSARAM' : '\n❌ ALGUMA VERIFICAÇÃO FALHOU');
+console.log(ok ? '\n✅ TODAS AS VERIFICAÇÕES PASSARAM' : '\n❌ ALGUMA VERIFICAÇÃO FALHOU');
 process.exit(ok ? 0 : 1);
