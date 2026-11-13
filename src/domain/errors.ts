@@ -1,47 +1,48 @@
 /**
- * Códigos de falha "estáveis".
+ * Códigos de falha ESTÁVEIS (contrato público: API, eventos, banco). Nunca renomear.
  *
- * Estável = o texto nunca muda. Esses códigos aparecem nas respostas da API,
- * nos eventos publicados e nas transações rejeitadas salvas no banco.
- * Se renomearmos um deles, quem depende do código (outros sistemas) quebra.
+ * Cada código diz ao provedor o que fazer — ver a tabela completa no ARCHITECTURE.md:
+ *   - CORRIGIR o payload antes de reenviar;
+ *   - DESISTIR: a decisão é definitiva (reenviar igual dá o mesmo resultado);
+ *   - REENVIAR mais tarde: falha temporária (esses não são FailureCode, são TransientError → 503).
  */
 export const FailureCode = {
-  INVALID_REQUEST: 'INVALID_REQUEST', // campos ausentes ou em formato errado
-  INVALID_AMOUNT: 'INVALID_AMOUNT', // valor inválido (formato errado, zero, negativo...)
+  // ---- Entrada inválida → corrigir o payload (HTTP 400) ----
+  INVALID_REQUEST: 'INVALID_REQUEST', // campo ausente, formato errado, kind OPENING enviado de fora
+  INVALID_AMOUNT: 'INVALID_AMOUNT', // valor mal formatado, com mais de 2 casas, zero ou negativo
   UNSUPPORTED_CURRENCY: 'UNSUPPORTED_CURRENCY', // moeda não aceita (ex.: USD)
-  CURRENCY_MISMATCH: 'CURRENCY_MISMATCH', // tentativa de misturar moedas diferentes
-  INSUFFICIENT_FUNDS: 'INSUFFICIENT_FUNDS', // saldo insuficiente para uma aposta (BET)
-  REVERSAL_WOULD_OVERDRAW: 'REVERSAL_WOULD_OVERDRAW', // estorno deixaria o saldo negativo
-  WALLET_NOT_FOUND: 'WALLET_NOT_FOUND', // carteira não existe
-  WALLET_ALREADY_EXISTS: 'WALLET_ALREADY_EXISTS', // jogador já tem carteira nessa moeda
-  TRANSACTION_NOT_FOUND: 'TRANSACTION_NOT_FOUND', // transação não existe
-  PLAYER_MISMATCH: 'PLAYER_MISMATCH', // a carteira informada não é deste jogador
 
-  // --- Referências (WIN, LOSS, REFUND e ROLLBACK apontam para outra transação) ---
-  REFERENCE_NOT_FOUND: 'REFERENCE_NOT_FOUND', // a transação referenciada nunca chegou (após as tentativas)
-  REFERENCE_MISMATCH: 'REFERENCE_MISMATCH', // referência de outro jogador/carteira/moeda/rodada/provedor
-  REFERENCE_INVALID_KIND: 'REFERENCE_INVALID_KIND', // ex.: WIN apontando para outro WIN
-  REFERENCE_NOT_PROCESSED: 'REFERENCE_NOT_PROCESSED', // referência foi rejeitada (não há o que pagar/desfazer)
-  REFERENCE_ROLLED_BACK: 'REFERENCE_ROLLED_BACK', // a aposta referenciada já foi desfeita
-  ROLLBACK_AMOUNT_MISMATCH: 'ROLLBACK_AMOUNT_MISMATCH', // estorno com valor diferente do original
-  ALREADY_ROLLED_BACK: 'ALREADY_ROLLED_BACK', // a transação já foi desfeita antes
-  REFUND_EXCEEDS_BET: 'REFUND_EXCEEDS_BET', // devolução maior que a aposta
-  ALREADY_REFUNDED: 'ALREADY_REFUNDED', // a aposta já foi devolvida
+  // ---- Não encontrado (HTTP 404) ----
+  WALLET_NOT_FOUND: 'WALLET_NOT_FOUND',
+  TRANSACTION_NOT_FOUND: 'TRANSACTION_NOT_FOUND',
 
-  // --- Conflitos de requisição (não viram transação rejeitada; respondem 409) ---
-  IDEMPOTENCY_KEY_REUSED: 'IDEMPOTENCY_KEY_REUSED', // mesma chave, conteúdo diferente
-  PROVIDER_TRANSACTION_CONFLICT: 'PROVIDER_TRANSACTION_CONFLICT', // mesmo id do provedor, conteúdo diferente
+  // ---- Conflitos (HTTP 409) ----
+  WALLET_ALREADY_EXISTS: 'WALLET_ALREADY_EXISTS', // já existe carteira para player + moeda
+  IDEMPOTENCY_KEY_REUSED: 'IDEMPOTENCY_KEY_REUSED', // mesma Idempotency-Key, payload diferente
+  PROVIDER_TRANSACTION_CONFLICT: 'PROVIDER_TRANSACTION_CONFLICT', // mesmo (providerId, externalTransactionId), payload diferente
+  INBOX_PAYLOAD_MISMATCH: 'INBOX_PAYLOAD_MISMATCH', // mesmo messageId da fila com conteúdo diferente
+
+  // ---- Rejeições de negócio: a transação é gravada como REJECTED (HTTP 422) ----
+  // Corrigir o payload:
+  CURRENCY_MISMATCH: 'CURRENCY_MISMATCH', // moeda da operação ≠ moeda da carteira
+  PLAYER_MISMATCH: 'PLAYER_MISMATCH', // a carteira não é deste jogador
+  REFERENCE_MISMATCH: 'REFERENCE_MISMATCH', // referência de outro provider/player/carteira/moeda/rodada
+  REFERENCE_INVALID_KIND: 'REFERENCE_INVALID_KIND', // ex.: REFUND apontando para um WIN
+  REVERSAL_AMOUNT_MISMATCH: 'REVERSAL_AMOUNT_MISMATCH', // REFUND/ROLLBACK com valor ≠ da referência
+  // Desistir (definitivo):
+  INSUFFICIENT_FUNDS: 'INSUFFICIENT_FUNDS', // BET maior que o saldo
+  REVERSAL_WOULD_OVERDRAW: 'REVERSAL_WOULD_OVERDRAW', // estorno de crédito já gasto (≠ de INSUFFICIENT_FUNDS)
+  REFERENCE_NOT_PROCESSED: 'REFERENCE_NOT_PROCESSED', // a referência foi rejeitada: nada a pagar/reverter
+  REFERENCE_ALREADY_REVERSED: 'REFERENCE_ALREADY_REVERSED', // a referência já foi revertida (REFUND ou ROLLBACK)
+  REFERENCE_NOT_FOUND: 'REFERENCE_NOT_FOUND', // a referência não chegou dentro do limite de tentativas
 } as const;
 
-/** Tipo que aceita apenas um dos valores acima (ex.: 'INSUFFICIENT_FUNDS'). */
+/** Tipo que aceita apenas um dos valores acima. */
 export type FailureCode = (typeof FailureCode)[keyof typeof FailureCode];
 
 /**
- * Erro de regra de negócio.
- *
- * É um erro "esperado": não é bug nem falha de infraestrutura.
- * Tentar de novo não adianta (o saldo continuará insuficiente),
- * por isso a transação deve ser REJEITADA, e não reprocessada.
+ * Erro de REGRA DE NEGÓCIO: esperado, não é bug.
+ * Tentar de novo com o mesmo pedido não muda o resultado.
  */
 export class DomainError extends Error {
   constructor(
@@ -50,5 +51,16 @@ export class DomainError extends Error {
   ) {
     super(message);
     this.name = new.target.name;
+  }
+}
+
+/**
+ * Erro de PROGRAMAÇÃO: alguém tentou mudar o estado de uma transação já finalizada
+ * (PROCESSED, REJECTED ou FAILED). Nunca é caminho de negócio — se acontecer, é bug.
+ */
+export class InvalidTransactionStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidTransactionStateError';
   }
 }

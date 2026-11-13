@@ -16,14 +16,12 @@ const STATUS_BY_CODE: Partial<Record<FailureCode, number>> = {
   [FailureCode.INVALID_REQUEST]: HttpStatus.BAD_REQUEST,
   [FailureCode.INVALID_AMOUNT]: HttpStatus.BAD_REQUEST,
   [FailureCode.UNSUPPORTED_CURRENCY]: HttpStatus.BAD_REQUEST,
-  [FailureCode.CURRENCY_MISMATCH]: HttpStatus.UNPROCESSABLE_ENTITY,
-  [FailureCode.INSUFFICIENT_FUNDS]: HttpStatus.UNPROCESSABLE_ENTITY,
-  [FailureCode.REVERSAL_WOULD_OVERDRAW]: HttpStatus.UNPROCESSABLE_ENTITY,
   [FailureCode.WALLET_NOT_FOUND]: HttpStatus.NOT_FOUND,
   [FailureCode.TRANSACTION_NOT_FOUND]: HttpStatus.NOT_FOUND,
   [FailureCode.WALLET_ALREADY_EXISTS]: HttpStatus.CONFLICT,
   [FailureCode.IDEMPOTENCY_KEY_REUSED]: HttpStatus.CONFLICT,
   [FailureCode.PROVIDER_TRANSACTION_CONFLICT]: HttpStatus.CONFLICT,
+  [FailureCode.INBOX_PAYLOAD_MISMATCH]: HttpStatus.CONFLICT,
 };
 
 // @Catch(DomainError): este filtro só trata erros desse tipo; os demais seguem o padrão do Nest.

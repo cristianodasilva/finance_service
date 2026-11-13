@@ -8,10 +8,10 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import { config } from '../config';
-import { runWithLogContext } from '../observability/log-context';
+import { enrichLogContext, runWithLogContext } from '../observability/log-context';
 import { metrics } from '../observability/metrics';
 import { ProcessWagerService } from '../wagering/process-wager.service';
-import { parseWagerCommand } from '../wagering/wager-command.parser';
+import { parseWagerMessage } from './wager-message.parser';
 import { classifyError } from './message-outcome';
 import { SQS_CLIENT } from './sqs.client';
 
@@ -30,6 +30,8 @@ import { SQS_CLIENT } from './sqs.client';
 export class WagerQueueConsumer implements OnApplicationBootstrap, OnApplicationShutdown {
   private readonly logger = new Logger(WagerQueueConsumer.name);
   private running = false;
+  /** true durante o desligamento (SIGTERM). */
+  private stopping = false;
   /** Permite interromper a espera da fila no desligamento. */
   private abort = new AbortController();
   private loop: Promise<void> | null = null;
@@ -56,6 +58,7 @@ export class WagerQueueConsumer implements OnApplicationBootstrap, OnApplication
     if (!this.running) return;
     this.logger.log(`Stopping SQS consumer (${signal ?? 'shutdown'})...`);
     this.running = false;
+    this.stopping = true;
     this.abort.abort(); // corta a espera do long polling
     await this.loop;
     this.logger.log('SQS consumer stopped');
@@ -106,19 +109,31 @@ export class WagerQueueConsumer implements OnApplicationBootstrap, OnApplication
   private handle(message: Message): Promise<void> {
     // Todos os logs desta mensagem levam o messageId como id de correlação.
     const messageId = message.MessageId!;
-    return runWithLogContext({ correlationId: messageId, messageId }, () => this.handleInContext(message));
+    return runWithLogContext({ correlationId: messageId }, () => this.handleInContext(message));
   }
 
   private async handleInContext(message: Message): Promise<void> {
-    const messageId = message.MessageId!;
+    const sqsMessageId = message.MessageId!;
+    // Desligando: mensagens ainda não iniciadas voltam para a fila imediatamente.
+    if (this.stopping) {
+      await this.releaseVisibility(message);
+      return;
+    }
     try {
-      const command = parseWagerCommand(JSON.parse(message.Body ?? ''));
-      const { transaction, replayed } = await this.processWager.execute(command, { type: 'sqs', messageId });
-      // Chegou aqui = COMMIT feito. Agora sim confirmamos (ack).
+      const parsed = parseWagerMessage(message.Body ?? '');
+      // O messageId do ENVELOPE (estável nas reentregas do produtor) é a chave da inbox.
+      enrichLogContext({ messageId: parsed.messageId });
+      const { transaction, replayed } = await this.processWager.execute(parsed.request, parsed.idempotencyKey, {
+        type: 'sqs',
+        consumerName: config.sqs.consumerName,
+        messageId: parsed.messageId,
+        messagePayloadHash: parsed.payloadHash,
+      });
+      // Chegou aqui = COMMIT feito. Só agora confirmamos (ack).
       await this.ack(message);
       metrics.sqsMessages.inc({ outcome: replayed ? 'duplicate' : 'processed' });
       this.logger.log(
-        `Message ${messageId} → ${transaction.status}${transaction.failureCode ? ` (${transaction.failureCode})` : ''}${replayed ? ' [duplicate]' : ''}`,
+        `Message processed → ${transaction.status}${transaction.failureCode ? ` (${transaction.failureCode})` : ''}${replayed ? ' [duplicate]' : ''}`,
       );
     } catch (error) {
       const { kind, code } = classifyError(error);
@@ -126,13 +141,26 @@ export class WagerQueueConsumer implements OnApplicationBootstrap, OnApplication
         await this.sendToDeadLetter(message, code, (error as Error).message);
         metrics.sqsMessages.inc({ outcome: 'dead_lettered' });
         metrics.deadLettered.inc({ reason: code });
-        this.logger.warn(`Message ${messageId} sent to DLQ: ${code}`);
+        this.logger.warn(`Message ${sqsMessageId} sent to DLQ: ${code}`);
       } else {
         await this.retryLater(message);
         metrics.sqsMessages.inc({ outcome: 'retried' });
-        this.logger.warn(`Message ${messageId} will be retried: ${code}`);
+        this.logger.warn(`Message ${sqsMessageId} will be retried: ${code}`);
       }
     }
+  }
+
+  /** Devolve a mensagem para a fila agora (visibilidade 0): outra instância a processa. */
+  private async releaseVisibility(message: Message): Promise<void> {
+    await this.sqs
+      .send(
+        new ChangeMessageVisibilityCommand({
+          QueueUrl: config.sqs.wagerQueueUrl,
+          ReceiptHandle: message.ReceiptHandle!,
+          VisibilityTimeout: 0,
+        }),
+      )
+      .catch(() => undefined);
   }
 
   /** Apaga a mensagem da fila: "processei, pode esquecer". */

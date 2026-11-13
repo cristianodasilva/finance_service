@@ -1,55 +1,63 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query } from '@nestjs/common';
-import { DomainError, FailureCode } from '../domain/errors';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { ProviderAuthGuard } from '../auth/provider-auth.guard';
 import { requireObject, requireString, requireUuid } from '../common/validation';
-import { WalletMapper, type WalletResponse } from './wallet.mapper';
+import { DomainError, FailureCode } from '../domain/errors';
+import type { MoneyProps } from '../domain/money/money';
+import { ReconciliationService } from '../reconciliation/reconciliation.service';
+import { walletView, type WalletView } from './wallet.view';
 import { WalletsService } from './wallets.service';
 
-/**
- * Controller = a "porta de entrada" HTTP. Ele só:
- *   1. lê e valida a requisição;
- *   2. chama o service (onde ficam as regras);
- *   3. devolve a resposta.
- */
 @Controller('wallets')
+@UseGuards(ProviderAuthGuard)
 export class WalletsController {
-  constructor(private readonly wallets: WalletsService) {}
+  constructor(
+    private readonly wallets: WalletsService,
+    private readonly reconciliation: ReconciliationService,
+  ) {}
 
-  /** POST /wallets — abre uma carteira. Responde 201 (Created). */
+  /** POST /wallets — { playerId, initialBalance: { amount, currency } } → 201. */
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  async create(@Body() body: unknown): Promise<WalletResponse> {
+  async create(@Body() body: unknown): Promise<WalletView> {
     const obj = requireObject(body);
+    const initialBalance = obj.initialBalance;
+    if (typeof initialBalance !== 'object' || initialBalance === null) {
+      throw new DomainError(FailureCode.INVALID_REQUEST, '"initialBalance" must be { amount, currency }');
+    }
     const wallet = await this.wallets.create({
       playerId: requireString(obj, 'playerId'),
-      currency: requireString(obj, 'currency', 3),
-      // Repassado como veio: o Money recusa se não for string decimal (ex.: um number).
-      initialBalance: obj.initialBalance === undefined ? undefined : (obj.initialBalance as string),
+      initialBalance: initialBalance as MoneyProps,
     });
-    return WalletMapper.toResponse(wallet);
-  }
-
-  /** GET /wallets/:id — consulta uma carteira. */
-  @Get(':id')
-  async findOne(@Param('id') id: string): Promise<WalletResponse> {
-    const wallet = await this.wallets.findById(requireUuid(id));
-    return WalletMapper.toResponse(wallet);
+    return walletView(wallet);
   }
 
   /** GET /wallets?playerId=X — carteiras de um jogador. */
   @Get()
-  async findByPlayer(@Query('playerId') playerId?: string): Promise<WalletResponse[]> {
+  async findByPlayer(@Query('playerId') playerId?: string): Promise<WalletView[]> {
     if (!playerId) throw new DomainError(FailureCode.INVALID_REQUEST, 'Query param "playerId" is required');
-    const wallets = await this.wallets.findByPlayer(playerId);
-    return wallets.map((w) => WalletMapper.toResponse(w));
+    return (await this.wallets.findByPlayer(playerId)).map(walletView);
   }
 
-  /** GET /wallets/:id/ledger?limit=50&cursor=... — extrato paginado. */
-  @Get(':id/ledger')
-  async ledger(@Param('id') id: string, @Query('limit') limit?: string, @Query('cursor') cursor?: string) {
+  /** GET /wallets/:walletId */
+  @Get(':walletId')
+  async findOne(@Param('walletId') walletId: string): Promise<WalletView> {
+    return walletView(await this.wallets.findById(requireUuid(walletId, 'walletId')));
+  }
+
+  /** GET /wallets/:walletId/ledger?cursor=...&limit=50 */
+  @Get(':walletId/ledger')
+  async ledger(@Param('walletId') walletId: string, @Query('limit') limit?: string, @Query('cursor') cursor?: string) {
     const parsedLimit = limit === undefined ? 50 : Number(limit);
     if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 200) {
       throw new DomainError(FailureCode.INVALID_REQUEST, '"limit" must be an integer between 1 and 200');
     }
-    return this.wallets.ledger(requireUuid(id), { limit: parsedLimit, cursor });
+    return this.wallets.ledger(requireUuid(walletId, 'walletId'), { limit: parsedLimit, cursor });
+  }
+
+  /** POST /wallets/:walletId/reconciliation — confere saldo × extrato desta carteira. */
+  @Post(':walletId/reconciliation')
+  @HttpCode(HttpStatus.OK)
+  reconcile(@Param('walletId') walletId: string) {
+    return this.reconciliation.reconcileWallet(requireUuid(walletId, 'walletId'));
   }
 }

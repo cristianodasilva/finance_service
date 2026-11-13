@@ -1,21 +1,17 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { Currency } from '../../src/domain/money/currency';
-import { Money } from '../../src/domain/money/money';
 import { ReconciliationService } from '../../src/reconciliation/reconciliation.service';
 import { ProcessWagerService } from '../../src/wagering/process-wager.service';
 import { WalletsService } from '../../src/wallets/wallets.service';
-import { createInstances, resetDatabase } from '../support/database';
+import { assertLedgerInvariant, createInstances, resetDatabase } from '../support/database';
+import { openWallet, request, submit } from '../support/fixtures';
 
 let orm: MikroORM;
-let wallets: WalletsService;
-let wagers: ProcessWagerService;
 let reconciliation: ReconciliationService;
+let tamperedWallet: string | null = null;
 
 beforeAll(async () => {
   [orm] = (await createInstances(1)) as [MikroORM];
-  wallets = new WalletsService(orm.em);
-  wagers = new ProcessWagerService(orm.em);
   reconciliation = new ReconciliationService(orm.em);
 });
 afterAll(async () => {
@@ -23,79 +19,78 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await resetDatabase(orm);
+  tamperedWallet = null;
+});
+afterEach(async () => {
+  if (tamperedWallet) await orm.em.fork().execute(`update wallets set balance = 95.00 where id = ?`, [tamperedWallet]);
+  await assertLedgerInvariant(orm);
 });
 
-/** Carteira com 100.00 e 5 apostas de 1.00 → 6 movimentos no extrato (versões 1..6). */
+/** 100.00 + 5 BETs de 1.00 → 6 lançamentos (versões 1..6). */
 async function walletWithMovements(): Promise<string> {
-  const w = await wallets.create({ playerId: 'p1', currency: 'BRL', initialBalance: '100.00' });
-  for (let i = 1; i <= 5; i++) {
-    await wagers.execute(
-      {
-        provider: 'prov',
-        providerTransactionId: `bet-${i}`,
-        kind: 'BET',
-        playerId: 'p1',
-        walletId: w.id,
-        amount: Money.fromDecimal('1.00', Currency.BRL),
-        roundId: null,
-        referenceProviderTransactionId: null,
-      },
-      { type: 'http', idempotencyKey: `k-${i}` },
-    );
-  }
-  return w.id;
+  const w = await openWallet(orm, '100.00');
+  const svc = new ProcessWagerService(orm.em);
+  for (let i = 1; i <= 5; i++) await submit(svc, request(w, 'BET', `bet-${i}`, '1.00'));
+  return w;
 }
 
-describe('Extrato paginado', () => {
-  test('percorre todas as páginas sem repetir nem pular movimentos', async () => {
-    const walletId = await walletWithMovements();
+describe('Extrato paginado (cursor)', () => {
+  test('percorre todas as páginas sem repetir nem pular', async () => {
+    const w = await walletWithMovements();
+    const wallets = new WalletsService(orm.em);
     const seen: number[] = [];
     let cursor: string | undefined;
-    let pages = 0;
     do {
-      const page = await wallets.ledger(walletId, { limit: 2, cursor });
+      const page = await wallets.ledger(w, { limit: 2, cursor });
       seen.push(...page.items.map((i) => i.walletVersion));
       cursor = page.nextCursor ?? undefined;
-      pages++;
     } while (cursor);
-
-    expect(pages).toBe(3);
-    expect(seen).toEqual([6, 5, 4, 3, 2, 1]); // mais recente primeiro
+    expect(seen).toEqual([6, 5, 4, 3, 2, 1]);
   });
 
-  test('primeiro item mostra o saldo atual e o tipo da transação', async () => {
-    const walletId = await walletWithMovements();
-    const { items } = await wallets.ledger(walletId, { limit: 1 });
-    expect(items[0]).toMatchObject({ direction: 'DEBIT', amount: '1.00', balanceAfter: '95.00', transactionKind: 'BET' });
+  test('cada item traz money, balanceBefore e balanceAfter no formato de contrato', async () => {
+    const w = await walletWithMovements();
+    const { items } = await new WalletsService(orm.em).ledger(w, { limit: 1 });
+    expect(items[0]).toMatchObject({
+      direction: 'DEBIT',
+      transactionKind: 'BET',
+      money: { amount: '1.00', currency: 'BRL' },
+      balanceBefore: { amount: '96.00', currency: 'BRL' },
+      balanceAfter: { amount: '95.00', currency: 'BRL' },
+    });
   });
 });
 
 describe('Reconciliação', () => {
-  test('sem divergências quando saldo == extrato', async () => {
-    await walletWithMovements();
-    const report = await reconciliation.run();
-    expect(report.checkedWallets).toBe(1);
-    expect(report.divergences).toEqual([]);
+  test('consistente: formato do contrato', async () => {
+    const w = await walletWithMovements();
+    expect(await reconciliation.reconcileWallet(w)).toMatchObject({
+      walletId: w,
+      storedBalance: { amount: '95.00', currency: 'BRL' },
+      calculatedBalance: { amount: '95.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 6,
+    });
   });
 
-  test('detecta e SINALIZA divergência, mas NÃO corrige o saldo', async () => {
-    const walletId = await walletWithMovements();
-    // Simula um problema: alguém alterou o saldo direto no banco, por fora da aplicação.
-    await orm.em.fork().execute(`update wallets set balance = 999.99 where id = ?`, [walletId]);
+  test('carteira aberta sem saldo (versão 1, nenhum lançamento) é consistente', async () => {
+    const w = await openWallet(orm, '0.00');
+    expect(await reconciliation.reconcileWallet(w)).toMatchObject({ consistent: true, checkedEntries: 0, storedVersion: 1 });
+  });
 
-    const report = await reconciliation.run();
-    expect(report.divergences).toEqual([
-      { walletId, storedBalance: '999.99', ledgerBalance: '95.00', storedVersion: 6, ledgerVersion: 6 },
-    ]);
+  test('divergência: sinalizada na resposta, logada, registrada — e NUNCA corrigida', async () => {
+    const w = await walletWithMovements();
+    tamperedWallet = w;
+    await orm.em.fork().execute(`update wallets set balance = 999.99 where id = ?`, [w]); // alguém mexeu por fora
 
-    // Executa de novo: continua UMA divergência aberta, só com o contador atualizado.
-    await reconciliation.run();
+    const result = await reconciliation.reconcileWallet(w);
+    expect(result).toMatchObject({ consistent: false, difference: { amount: '904.99', currency: 'BRL' } });
+    await reconciliation.reconcileWallet(w);
     const open = await reconciliation.openDivergences();
-    expect(open.length).toBe(1);
-    expect(open[0]).toMatchObject({ walletId, timesDetected: 2, status: 'OPEN' });
-
-    // E o saldo continua como estava: a reconciliação nunca corrige sozinha.
-    const [w] = await orm.em.fork().execute(`select balance::text from wallets where id = ?`, [walletId]);
-    expect(w!.balance).toBe('999.99');
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ walletId: w, timesDetected: 2 });
+    const [row] = await orm.em.fork().execute(`select balance::text from wallets where id = ?`, [w]);
+    expect(row!.balance).toBe('999.99'); // não corrigiu
   });
 });

@@ -1,72 +1,98 @@
 import { DomainError, FailureCode } from '../errors';
-import { Currency } from '../money/currency';
+import { LedgerDirection, WalletLedgerEntry } from '../ledger/wallet-ledger-entry';
+import type { Currency } from '../money/currency';
 import { Money } from '../money/money';
 
-/** Dados necessários para montar uma carteira. */
-export interface WalletProps {
+export interface WalletState {
   id: string;
   playerId: string;
   currency: Currency;
   balance: Money;
   version: number;
   createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Dados de um movimento: a qual transação pertence e qual id terá o lançamento. */
+export interface MovementContext {
+  transactionId: string;
+  entryId: string;
+  at: Date;
 }
 
 /**
- * Carteira (wallet): existe uma por jogador + moeda.
+ * Carteira (Aggregate Root): uma por jogador + moeda.
  *
- * Regras que esta classe garante (invariantes = regras sempre verdadeiras):
- *  - o saldo nunca fica negativo;
- *  - o saldo está sempre na mesma moeda da carteira;
- *  - `version` só aumenta quando o saldo realmente muda.
- *    (A versão será usada no banco para detectar alterações simultâneas.)
- *
- * Esta classe não sabe nada de banco de dados. O mapeamento para tabela fica em outro lugar.
+ * Invariantes:
+ *  - saldo nunca negativo;
+ *  - a moeda de cada operação é igual à da carteira;
+ *  - TODA alteração de saldo produz um lançamento no extrato (credit/debit DEVOLVEM o lançamento);
+ *  - `version` começa em 1 na criação e só sobe quando o saldo muda.
  */
 export class Wallet {
-  readonly id: string;
-  readonly playerId: string;
-  readonly currency: Currency;
-  readonly createdAt: Date;
-
-  // "_" + private: só a própria classe altera. De fora, só leitura (pelos getters abaixo).
-  private _balance: Money;
-  private _version: number;
-
-  private constructor(props: WalletProps) {
-    if (!props.balance.currency.equals(props.currency)) {
-      throw new DomainError(FailureCode.CURRENCY_MISMATCH, 'Balance currency differs from wallet currency');
-    }
-    if (props.balance.isNegative()) {
-      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Wallet balance cannot be negative');
-    }
-    this.id = props.id;
-    this.playerId = props.playerId;
-    this.currency = props.currency;
-    this.createdAt = props.createdAt;
-    this._balance = props.balance;
-    this._version = props.version;
-  }
+  private constructor(
+    readonly id: string,
+    readonly playerId: string,
+    readonly currency: Currency,
+    private _balance: Money,
+    private _version: number,
+    readonly createdAt: Date,
+    private _updatedAt: Date,
+    /** Lançamento do saldo inicial (só em carteiras recém-abertas com saldo > 0). */
+    readonly openingEntry: WalletLedgerEntry | null,
+  ) {}
 
   /**
-   * Abre uma carteira NOVA, com saldo zero.
-   * Se houver saldo inicial, ele entra depois via `credit` (transação OPENING),
-   * para que também fique registrado no extrato (ledger).
+   * Abre uma carteira (versão 1). Se `initialBalance` > 0, já cria o lançamento CREDIT
+   * da transação interna OPENING — saldo e extrato nascem consistentes.
    */
-  static open(params: { id: string; playerId: string; currency: Currency; now?: Date }): Wallet {
-    return new Wallet({
-      id: params.id,
-      playerId: params.playerId,
-      currency: params.currency,
-      balance: Money.zero(params.currency),
-      version: 0,
-      createdAt: params.now ?? new Date(),
-    });
+  static open(props: {
+    id: string;
+    playerId: string;
+    initialBalance: Money;
+    /** Obrigatórios quando initialBalance > 0. */
+    openingTransactionId?: string;
+    openingEntryId?: string;
+    at?: Date;
+  }): Wallet {
+    const at = props.at ?? new Date();
+    const initial = props.initialBalance;
+    if (initial.isNegative()) {
+      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Initial balance cannot be negative');
+    }
+
+    let openingEntry: WalletLedgerEntry | null = null;
+    if (initial.isPositive()) {
+      if (!props.openingTransactionId || !props.openingEntryId) {
+        throw new Error('openingTransactionId and openingEntryId are required for a positive initial balance');
+      }
+      openingEntry = WalletLedgerEntry.create({
+        id: props.openingEntryId,
+        walletId: props.id,
+        transactionId: props.openingTransactionId,
+        direction: LedgerDirection.Credit,
+        money: initial,
+        balanceBefore: Money.zero(initial.currency),
+        balanceAfter: initial,
+        walletVersion: 1,
+        createdAt: at,
+      });
+    }
+    return new Wallet(props.id, props.playerId, initial.currency, initial, 1, at, at, openingEntry);
   }
 
-  /** Remonta uma carteira que já existe, a partir dos dados lidos do banco. */
-  static restore(props: WalletProps): Wallet {
-    return new Wallet(props);
+  /** Reconstrói a partir do banco. Não revalida regras — só remonta o estado salvo. */
+  static rehydrate(state: WalletState): Wallet {
+    return new Wallet(
+      state.id,
+      state.playerId,
+      state.currency,
+      state.balance,
+      state.version,
+      state.createdAt,
+      state.updatedAt,
+      null,
+    );
   }
 
   get balance(): Money {
@@ -77,59 +103,77 @@ export class Wallet {
     return this._version;
   }
 
-  /** Adiciona dinheiro (WIN, REFUND, OPENING, ou estorno de uma BET). */
-  credit(amount: Money): void {
-    this.assertValidAmount(amount);
-    this.applyDelta(amount);
+  get updatedAt(): Date {
+    return this._updatedAt;
   }
 
-  /** Retira dinheiro para uma aposta (BET). Falha com INSUFFICIENT_FUNDS se não houver saldo. */
-  debit(amount: Money): void {
-    this.assertValidAmount(amount);
-    if (this._balance.lessThan(amount)) {
+  /** Entra dinheiro (WIN, REFUND, ROLLBACK de uma BET). Devolve o lançamento CREDIT. */
+  credit(money: Money, ctx: MovementContext): WalletLedgerEntry {
+    this.assertValidAmount(money);
+    return this.apply(LedgerDirection.Credit, money, ctx);
+  }
+
+  /** Sai dinheiro para uma aposta (BET). Sem saldo → INSUFFICIENT_FUNDS. */
+  debit(money: Money, ctx: MovementContext): WalletLedgerEntry {
+    this.assertValidAmount(money);
+    if (this._balance.isLessThan(money)) {
       throw new DomainError(
         FailureCode.INSUFFICIENT_FUNDS,
-        `Insufficient funds: balance ${this._balance.toDecimal()}, requested ${amount.toDecimal()}`,
+        `Insufficient funds: balance ${this._balance.toDecimal()}, requested ${money.toDecimal()}`,
       );
     }
-    this.applyDelta(amount.negate());
+    return this.apply(LedgerDirection.Debit, money, ctx);
   }
 
   /**
-   * Retira dinheiro para desfazer um crédito anterior (ROLLBACK de um WIN/REFUND).
-   *
-   * Usa um código de erro DIFERENTE do `debit`: aqui o prêmio já foi pago
-   * e o jogador já gastou. Não é "aposta sem saldo"; é um caso que
-   * normalmente precisa de atenção da equipe de operações.
+   * Sai dinheiro para DESFAZER um crédito (ROLLBACK de WIN/REFUND).
+   * Código diferente do `debit`: o dinheiro já foi pago e gasto — caso operacional, não "aposta sem saldo".
    */
-  reverseCredit(amount: Money): void {
-    this.assertValidAmount(amount);
-    if (this._balance.lessThan(amount)) {
+  reverseCredit(money: Money, ctx: MovementContext): WalletLedgerEntry {
+    this.assertValidAmount(money);
+    if (this._balance.isLessThan(money)) {
       throw new DomainError(
         FailureCode.REVERSAL_WOULD_OVERDRAW,
-        `Reversal would overdraw: balance ${this._balance.toDecimal()}, reversal ${amount.toDecimal()}`,
+        `Reversal would overdraw: balance ${this._balance.toDecimal()}, reversal ${money.toDecimal()}`,
       );
     }
-    this.applyDelta(amount.negate());
+    return this.apply(LedgerDirection.Debit, money, ctx);
   }
 
-  /** Aplica a variação (delta) no saldo e incrementa a versão. */
-  private applyDelta(delta: Money): void {
-    if (delta.isZero()) return; // saldo não mudou → versão não muda
-    this._balance = this._balance.add(delta);
+  /** Único lugar que muda saldo e versão — e sempre gera o lançamento correspondente. */
+  private apply(direction: LedgerDirection, money: Money, ctx: MovementContext): WalletLedgerEntry {
+    const before = this._balance;
+    const after = direction === LedgerDirection.Credit ? before.add(money) : before.subtract(money);
+    const entry = WalletLedgerEntry.create({
+      id: ctx.entryId,
+      walletId: this.id,
+      transactionId: ctx.transactionId,
+      direction,
+      money,
+      balanceBefore: before,
+      balanceAfter: after,
+      walletVersion: this._version + 1,
+      createdAt: ctx.at,
+    });
+    this._balance = after;
     this._version += 1;
+    this._updatedAt = ctx.at;
+    return entry;
   }
 
-  /** O valor precisa ser da mesma moeda e maior que zero. */
-  private assertValidAmount(amount: Money): void {
-    if (!amount.currency.equals(this.currency)) {
+  private assertValidAmount(money: Money): void {
+    this.assertSameCurrency(money);
+    if (!money.isPositive()) {
+      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Amount must be greater than zero');
+    }
+  }
+
+  private assertSameCurrency(money: Money): void {
+    if (!money.currency.equals(this.currency)) {
       throw new DomainError(
         FailureCode.CURRENCY_MISMATCH,
-        `Wallet currency is ${this.currency.code}, got ${amount.currency.code}`,
+        `Wallet currency is ${this.currency.code}, got ${money.currency.code}`,
       );
-    }
-    if (!amount.isPositive()) {
-      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Amount must be greater than zero');
     }
   }
 }

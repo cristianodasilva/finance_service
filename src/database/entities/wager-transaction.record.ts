@@ -1,29 +1,32 @@
 import { EntitySchema } from '@mikro-orm/core';
+import type { WagerKind, WagerStatus } from '../../domain/wager/wager-transaction';
 
-import type { WagerKind, WagerStatus } from '../../domain/wager/wager-kind';
-
-export type { WagerKind, WagerStatus };
-
-/** Uma linha da tabela `wager_transactions`. */
+/** Uma linha de `wager_transactions`, do jeito que está no banco (texto, datas, sem regras). */
 export class WagerTransactionRecord {
   id!: string;
-  provider!: string;
-  providerTransactionId!: string;
+  providerId!: string;
+  externalTransactionId!: string;
+  idempotencyKey!: string;
+  payloadHash!: string;
   kind!: WagerKind;
   status!: WagerStatus;
   playerId!: string;
   walletId!: string;
   currency!: string;
   amount!: string;
-  roundId?: string | null;
-  referenceProviderTransactionId?: string | null;
-  referencedTransactionId?: string | null;
-  failureCode?: string | null;
+  roundId!: string | null;
+  gameId!: string | null;
+  referenceExternalTransactionId!: string | null;
+  referenceTransactionId!: string | null;
+  failureCode!: string | null;
+  /** Saldo observado no momento da decisão (devolvido no replay). */
+  resultingBalance!: string;
+  /** Controle do worker de PENDING_REFERENCE. */
   attempts!: number;
-  nextAttemptAt?: Date | null;
+  nextAttemptAt!: Date | null;
   createdAt!: Date;
   updatedAt!: Date;
-  processedAt?: Date | null;
+  processedAt!: Date | null;
 }
 
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
@@ -31,8 +34,10 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
   tableName: 'wager_transactions',
   properties: {
     id: { type: 'uuid', primary: true },
-    provider: { type: 'text' },
-    providerTransactionId: { type: 'text' },
+    providerId: { type: 'text' },
+    externalTransactionId: { type: 'text' },
+    idempotencyKey: { type: 'text' },
+    payloadHash: { type: 'text' },
     kind: { type: 'text' },
     status: { type: 'text' },
     playerId: { type: 'text' },
@@ -40,9 +45,11 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     currency: { type: 'string', columnType: 'char(3)' },
     amount: { type: 'decimal', columnType: 'numeric(20,2)' },
     roundId: { type: 'text', nullable: true },
-    referenceProviderTransactionId: { type: 'text', nullable: true },
-    referencedTransactionId: { type: 'uuid', nullable: true },
+    gameId: { type: 'text', nullable: true },
+    referenceExternalTransactionId: { type: 'text', nullable: true },
+    referenceTransactionId: { type: 'uuid', nullable: true },
     failureCode: { type: 'text', nullable: true },
+    resultingBalance: { type: 'decimal', columnType: 'numeric(20,2)' },
     attempts: { type: 'integer' },
     nextAttemptAt: { type: 'Date', columnType: 'timestamptz', nullable: true },
     createdAt: { type: 'Date', columnType: 'timestamptz' },

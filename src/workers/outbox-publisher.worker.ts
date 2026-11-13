@@ -2,28 +2,27 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { config } from '../config';
+import { OutboxMessage } from '../domain/messaging/outbox-message';
 import { SQS_CLIENT } from '../messaging/sqs.client';
 import { metrics } from '../observability/metrics';
 import { PollingWorker } from './polling-worker';
 
 interface OutboxRow {
   id: string;
-  event_type: string;
   aggregate_id: string;
+  event_type: string;
   payload: Record<string, unknown>;
+  occurred_at: Date;
   attempts: number;
+  next_attempt_at: Date;
 }
 
 /**
- * Publicador da OUTBOX: lê eventos ainda não publicados e envia para a fila de eventos.
+ * Publicador da OUTBOX. Vários podem rodar ao mesmo tempo (um por instância):
+ * `FOR UPDATE SKIP LOCKED` faz cada um pegar linhas diferentes, sem esperar nem repetir.
  *
- * Vários publicadores podem rodar ao mesmo tempo (um por instância) com segurança,
- * graças ao `FOR UPDATE SKIP LOCKED`: cada um TRAVA as linhas que pegou,
- * e os outros PULAM essas linhas em vez de esperar. Ninguém pega o mesmo evento.
- *
- * Garantia: "pelo menos uma vez" (at-least-once). Se o processo morrer DEPOIS de enviar
- * e ANTES do COMMIT, o evento será enviado de novo. Por isso todo evento tem um
- * `eventId` único: quem consome usa esse id para ignorar repetições.
+ * Entrega "pelo menos uma vez": se morrer entre enviar e o COMMIT da marcação, o evento
+ * é reenviado (por outra instância, inclusive). Quem consome descarta repetições pelo eventId.
  */
 @Injectable()
 export class OutboxPublisherWorker extends PollingWorker {
@@ -41,9 +40,9 @@ export class OutboxPublisherWorker extends PollingWorker {
   async runOnce(batchSize = config.outbox.batchSize): Promise<number> {
     return this.em.fork().transactional(async (tx) => {
       const rows = await tx.execute<OutboxRow[]>(
-        `select id, event_type, aggregate_id, payload, attempts
+        `select id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at
            from outbox_events
-          where published_at is null and available_at <= now()
+          where published_at is null and next_attempt_at <= now()
           order by occurred_at, id
           limit ?
           for update skip locked`,
@@ -51,34 +50,44 @@ export class OutboxPublisherWorker extends PollingWorker {
       );
 
       for (const row of rows) {
+        const msg = OutboxMessage.rehydrate({
+          id: row.id,
+          aggregateId: row.aggregate_id,
+          eventType: row.event_type,
+          payload: row.payload,
+          occurredAt: new Date(row.occurred_at),
+          attempts: row.attempts,
+          nextAttemptAt: new Date(row.next_attempt_at),
+          publishedAt: null,
+        });
+        const now = new Date();
         try {
           await this.sqs.send(
             new SendMessageCommand({
               QueueUrl: config.sqs.eventsQueueUrl,
-              MessageBody: JSON.stringify(row.payload),
-              // Mesmo grupo = mesma entidade → eventos dela chegam em ordem.
-              MessageGroupId: row.aggregate_id,
-              // O próprio SQS também descarta repetições do mesmo evento (janela de 5 min).
-              MessageDeduplicationId: row.id,
-              MessageAttributes: { eventType: { DataType: 'String', StringValue: row.event_type } },
+              MessageBody: JSON.stringify(msg.payload),
+              MessageGroupId: msg.aggregateId, // eventos da mesma entidade em ordem
+              MessageDeduplicationId: msg.id, // o FIFO também descarta a cópia (janela de 5 min)
+              MessageAttributes: { eventType: { DataType: 'String', StringValue: msg.eventType } },
             }),
           );
-          await tx.execute(
-            `update outbox_events set published_at = now(), attempts = attempts + 1, last_error = null where id = ?`,
-            [row.id],
-          );
-          metrics.outboxPublished.inc({ event_type: row.event_type });
+          msg.markPublished(now);
+          await tx.execute(`update outbox_events set published_at = ?, attempts = ?, last_error = null where id = ?`, [
+            msg.publishedAt,
+            msg.attempts,
+            msg.id,
+          ]);
+          metrics.outboxPublished.inc({ event_type: msg.eventType });
         } catch (error) {
+          msg.scheduleRetry(now); // attempts + 1 e próxima tentativa com espera exponencial
+          await tx.execute(`update outbox_events set attempts = ?, next_attempt_at = ?, last_error = ? where id = ?`, [
+            msg.attempts,
+            msg.nextAttemptAt,
+            (error as Error).message.slice(0, 500),
+            msg.id,
+          ]);
           metrics.outboxPublishFailures.inc();
-          // Falhou: registra o erro e agenda nova tentativa com espera crescente (até 5 min).
-          const delaySeconds = Math.min(2 ** (row.attempts + 1), 300);
-          await tx.execute(
-            `update outbox_events
-                set attempts = attempts + 1, last_error = ?, available_at = now() + (? * interval '1 second')
-              where id = ?`,
-            [(error as Error).message.slice(0, 500), delaySeconds, row.id],
-          );
-          this.logger.warn(`Failed to publish event ${row.id} (${row.event_type}): ${(error as Error).message}`);
+          this.logger.warn(`Failed to publish event ${msg.id} (${msg.eventType}): ${(error as Error).message}`);
         }
       }
       return rows.length;

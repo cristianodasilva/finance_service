@@ -1,153 +1,113 @@
 import { DomainError, FailureCode } from '../errors';
-import type { Money } from '../money/money';
+import type { WalletLedgerEntry } from '../ledger/wallet-ledger-entry';
 import type { Wallet } from '../wallet/wallet';
-import type { WagerKind, WagerStatus } from './wager-kind';
+import { WagerKind, WagerStatus, type WagerTransaction } from './wager-transaction';
 
 /**
- * REGRAS DE NEGÓCIO das transações de aposta, em TypeScript puro (sem banco).
+ * REGRAS DE NEGÓCIO (TypeScript puro, sem banco).
  *
- * A função `decideWager` recebe tudo o que precisa já carregado
- * (carteira, transação referenciada, etc.) e devolve a DECISÃO:
- *   - PROCESSED (com o movimento de saldo, se houver),
- *   - REJECTED (com o código do motivo), ou
- *   - PENDING_REFERENCE (a referência ainda não chegou).
- *
- * Ela também aplica o movimento na carteira (credit/debit/reverseCredit).
- * Quem chama é responsável por gravar o resultado no banco.
+ * `decideWager` recebe tudo já carregado, aplica a regra do tipo da transação na carteira
+ * e faz a transição de estado da transação. Devolve o lançamento do extrato, se houver.
  */
 
-/** O pedido que chegou (do HTTP ou da fila), já validado. */
-export interface WagerCommand {
-  provider: string;
-  providerTransactionId: string;
-  kind: WagerKind;
-  playerId: string;
-  walletId: string;
-  amount: Money;
-  roundId: string | null;
-  referenceProviderTransactionId: string | null;
+/** A transação referenciada + se ela já foi revertida (existe REFUND ou ROLLBACK PROCESSED apontando para ela). */
+export interface ReferenceContext {
+  transaction: WagerTransaction;
+  reversed: boolean;
 }
 
-/** Resumo da transação referenciada (lida do banco). */
-export interface ReferenceSnapshot {
-  id: string;
-  provider: string;
-  kind: WagerKind;
-  status: WagerStatus;
-  playerId: string;
-  walletId: string;
-  amount: Money;
-  roundId: string | null;
-  /** Já existe um ROLLBACK processado apontando para ela? */
-  rolledBack: boolean;
-  /** Já existe um REFUND processado apontando para ela? */
-  refunded: boolean;
-}
-
-export type LedgerMovement = { direction: 'CREDIT' | 'DEBIT'; amount: Money };
-
-export type WagerDecision =
-  | { status: 'PROCESSED'; movement: LedgerMovement | null }
+export type WagerOutcome =
+  | { status: 'PROCESSED'; entry: WalletLedgerEntry | null }
   | { status: 'REJECTED'; failureCode: FailureCode }
   | { status: 'PENDING_REFERENCE' };
 
-const rejected = (failureCode: FailureCode): WagerDecision => ({ status: 'REJECTED', failureCode });
+/** Que tipo de transação cada tipo pode referenciar. */
+const ALLOWED_REFERENCES: Partial<Record<WagerKind, readonly WagerKind[]>> = {
+  WIN: ['BET'],
+  LOSS: ['BET'],
+  REFUND: ['BET'],
+  ROLLBACK: ['BET', 'WIN', 'REFUND'],
+};
 
 export function decideWager(params: {
-  command: WagerCommand;
+  transaction: WagerTransaction;
   wallet: Wallet;
-  /** `null` = a referência não foi encontrada (ainda). `undefined` = não precisa de referência. */
-  reference: ReferenceSnapshot | null | undefined;
-}): WagerDecision {
-  const { command, wallet, reference } = params;
+  /** undefined = a transação não referencia nada; null = referencia algo que (ainda) não existe. */
+  reference: ReferenceContext | null | undefined;
+  entryId: string;
+  at: Date;
+}): WagerOutcome {
+  const { transaction: tx, wallet, reference, at } = params;
+  const reject = (code: FailureCode): WagerOutcome => {
+    tx.reject(code, at);
+    return { status: 'REJECTED', failureCode: code };
+  };
 
-  // 1) A carteira precisa ser do jogador e da moeda informados.
-  if (wallet.playerId !== command.playerId) return rejected(FailureCode.PLAYER_MISMATCH);
-  if (!wallet.currency.equals(command.amount.currency)) return rejected(FailureCode.CURRENCY_MISMATCH);
+  // 1) Carteira do jogador certo, na moeda certa.
+  if (wallet.playerId !== tx.playerId) return reject(FailureCode.PLAYER_MISMATCH);
+  if (!wallet.currency.equals(tx.money.currency)) return reject(FailureCode.CURRENCY_MISMATCH);
 
-  // 2) Transações que dependem de outra: a referência precisa existir e "bater".
-  if (reference === null) return { status: 'PENDING_REFERENCE' };
-  if (reference !== undefined) {
-    const problem = checkReference(command, reference);
-    if (problem) return rejected(problem);
+  // 2) Referência (obrigatória em REFUND/ROLLBACK; opcional em WIN/LOSS).
+  if (tx.referenceExternalTransactionId !== null) {
+    // Ausente — ou existe mas ainda não foi decidida → aguardar.
+    if (reference === null || reference === undefined || !reference.transaction.isTerminal()) {
+      tx.markPendingReference();
+      return { status: 'PENDING_REFERENCE' };
+    }
+    tx.linkReference(reference.transaction.id);
+    const problem = checkReference(tx, reference);
+    if (problem) return reject(problem);
   }
 
-  // 3) Aplica a regra de cada tipo. Erros de domínio (ex.: sem saldo) viram REJECTED.
+  // 3) Efeito no saldo. Erros de domínio (ex.: saldo insuficiente) viram REJECTED.
   try {
-    return applyKind(command, wallet, reference ?? undefined);
+    const entry = applyMovement(tx, wallet, reference?.transaction, params.entryId, at);
+    tx.markProcessed(reference?.transaction.id, at);
+    return { status: 'PROCESSED', entry };
   } catch (error) {
-    if (error instanceof DomainError) return rejected(error.code);
+    if (error instanceof DomainError) return reject(error.code);
     throw error;
   }
 }
 
-/** Confere se a referência é compatível. Devolve o código do problema, ou null se ok. */
-function checkReference(command: WagerCommand, ref: ReferenceSnapshot): FailureCode | null {
-  // Precisa ser do mesmo provedor, jogador, carteira, moeda e rodada.
-  const sameRound = command.roundId === null || ref.roundId === null || command.roundId === ref.roundId;
+function checkReference(tx: WagerTransaction, ref: ReferenceContext): FailureCode | null {
+  const r = ref.transaction;
+  // Mesmo provider, jogador, carteira, moeda e rodada.
   if (
-    ref.provider !== command.provider ||
-    ref.playerId !== command.playerId ||
-    ref.walletId !== command.walletId ||
-    !ref.amount.currency.equals(command.amount.currency) ||
-    !sameRound
+    r.providerId !== tx.providerId ||
+    r.playerId !== tx.playerId ||
+    r.walletId !== tx.walletId ||
+    !r.money.currency.equals(tx.money.currency) ||
+    r.roundId !== tx.roundId
   ) {
     return FailureCode.REFERENCE_MISMATCH;
   }
-
-  // Que tipo de transação pode ser referenciada por cada tipo?
-  const allowed: Record<string, WagerKind[]> = {
-    WIN: ['BET'],
-    LOSS: ['BET'],
-    REFUND: ['BET'],
-    ROLLBACK: ['BET', 'WIN', 'REFUND'],
-  };
-  if (!allowed[command.kind]?.includes(ref.kind)) return FailureCode.REFERENCE_INVALID_KIND;
-
-  // Só faz sentido pagar/devolver/desfazer algo que foi PROCESSADO.
-  if (ref.status !== 'PROCESSED') return FailureCode.REFERENCE_NOT_PROCESSED;
-
-  if (command.kind === 'ROLLBACK') {
-    if (ref.rolledBack) return FailureCode.ALREADY_ROLLED_BACK;
-    if (!ref.amount.equals(command.amount)) return FailureCode.ROLLBACK_AMOUNT_MISMATCH;
-  } else {
-    // WIN/LOSS/REFUND sobre uma aposta que já foi desfeita não fazem sentido.
-    if (ref.rolledBack) return FailureCode.REFERENCE_ROLLED_BACK;
-  }
-
-  if (command.kind === 'REFUND') {
-    if (ref.refunded) return FailureCode.ALREADY_REFUNDED;
-    if (command.amount.greaterThan(ref.amount)) return FailureCode.REFUND_EXCEEDS_BET;
+  if (!ALLOWED_REFERENCES[tx.kind]?.includes(r.kind)) return FailureCode.REFERENCE_INVALID_KIND;
+  // Só se paga/reverte o que foi APLICADO.
+  if (r.status !== WagerStatus.Processed) return FailureCode.REFERENCE_NOT_PROCESSED;
+  // Já revertida (por REFUND ou ROLLBACK): nada mais pode usá-la.
+  // Isso impede, por exemplo, REFUND e depois ROLLBACK da mesma BET (crédito duplicado).
+  if (ref.reversed) return FailureCode.REFERENCE_ALREADY_REVERSED;
+  // Reversões devolvem exatamente o valor original (reversão parcial está fora de escopo).
+  if ((tx.kind === WagerKind.Refund || tx.kind === WagerKind.Rollback) && !r.money.equals(tx.money)) {
+    return FailureCode.REVERSAL_AMOUNT_MISMATCH;
   }
   return null;
 }
 
-function applyKind(command: WagerCommand, wallet: Wallet, ref: ReferenceSnapshot | undefined): WagerDecision {
-  const amount = command.amount;
-  switch (command.kind) {
-    case 'BET':
-      wallet.debit(amount); // pode lançar INSUFFICIENT_FUNDS
-      return { status: 'PROCESSED', movement: { direction: 'DEBIT', amount } };
+function applyMovement(
+  tx: WagerTransaction,
+  wallet: Wallet,
+  reference: WagerTransaction | undefined,
+  entryId: string,
+  at: Date,
+): WalletLedgerEntry | null {
+  if (!tx.affectsBalance()) return null; // LOSS: nada muda no saldo nem no extrato
+  const ctx = { transactionId: tx.id, entryId, at };
+  const direction = tx.ledgerDirectionFor(reference);
 
-    case 'WIN':
-    case 'REFUND':
-      wallet.credit(amount);
-      return { status: 'PROCESSED', movement: { direction: 'CREDIT', amount } };
-
-    case 'LOSS':
-      // Perda: a aposta já foi debitada no BET. Nada muda no saldo.
-      return { status: 'PROCESSED', movement: null };
-
-    case 'ROLLBACK':
-      // Desfaz a transação original fazendo o movimento CONTRÁRIO.
-      if (ref!.kind === 'BET') {
-        wallet.credit(amount); // devolve o valor apostado
-        return { status: 'PROCESSED', movement: { direction: 'CREDIT', amount } };
-      }
-      wallet.reverseCredit(amount); // retira o prêmio/devolução: pode lançar REVERSAL_WOULD_OVERDRAW
-      return { status: 'PROCESSED', movement: { direction: 'DEBIT', amount } };
-
-    case 'OPENING':
-      throw new Error('OPENING is internal and cannot be processed here');
-  }
+  if (direction === 'CREDIT') return wallet.credit(tx.money, ctx);
+  // Débito de ROLLBACK (desfaz WIN/REFUND): código próprio se deixaria o saldo negativo.
+  if (tx.kind === WagerKind.Rollback) return wallet.reverseCredit(tx.money, ctx);
+  return wallet.debit(tx.money, ctx);
 }

@@ -1,148 +1,145 @@
 import { DomainError, FailureCode } from '../errors';
 import { Currency } from './currency';
 
+/** Formato do dinheiro nos contratos (API, fila, eventos): { "amount": "25.00", "currency": "BRL" }. */
+export interface MoneyProps {
+  /** Texto decimal com 2 casas, ex.: "25.00". */
+  amount: string;
+  /** Código ISO-4217, ex.: "BRL". */
+  currency: string;
+}
+
+/** Aceita "10", "10.5", "10.50" (até 2 casas). Rejeita sinal, espaços, vírgula, notação científica... */
+const INPUT_AMOUNT = /^(\d+)(?:\.(\d{1,2}))?$/;
+/** Formato interno (permite sinal, para diferenças como a da reconciliação). */
+const SIGNED_AMOUNT = /^(-?)(\d+)(?:\.(\d+))?$/;
+
 /**
- * Valor monetário imutável (não pode ser alterado depois de criado).
+ * Valor monetário imutável.
  *
- * Por dentro, guardamos a quantidade de CENTAVOS num `bigint`
- * (número inteiro sem limite de tamanho). Ex.: R$ 100,50 → 10050n.
- * Contas com inteiros são exatas; nunca usamos `number` (ponto flutuante).
- *
- * Para entrar e sair do sistema usamos texto (string) com casas fixas: "100.50".
+ * Por dentro: quantidade de CENTAVOS num `bigint` (inteiro exato, sem limite).
+ * Ex.: R$ 100,50 → 10050n. Nunca usamos `number` (ponto flutuante) para dinheiro.
+ * Por fora: sempre texto com 2 casas ("100.50").
  */
 export class Money {
   private constructor(
-    /** Valor em centavos (pode ser negativo, ex.: ao calcular uma diferença). */
+    /** Valor em centavos (pode ser negativo, ex.: numa diferença). */
     readonly minor: bigint,
     readonly currency: Currency,
   ) {
     Object.freeze(this);
   }
 
-  /** Cria R$ 0,00. */
-  static zero(currency: Currency): Money {
-    return new Money(0n, currency);
+  /**
+   * Cria a partir do formato de CONTRATO ({ amount, currency }).
+   * Rejeita: não-string, "", NaN, Infinity, "1e3", mais de 2 casas e NEGATIVOS.
+   */
+  static from(props: MoneyProps): Money {
+    if (typeof props !== 'object' || props === null) {
+      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Money must be an object { amount, currency }');
+    }
+    if (typeof props.currency !== 'string') {
+      throw new DomainError(FailureCode.UNSUPPORTED_CURRENCY, 'Currency must be an ISO-4217 string');
+    }
+    const currency = Currency.of(props.currency);
+    if (typeof props.amount !== 'string') {
+      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Amount must be a decimal string');
+    }
+    const match = INPUT_AMOUNT.exec(props.amount);
+    if (!match) {
+      throw new DomainError(
+        FailureCode.INVALID_AMOUNT,
+        `Invalid amount "${props.amount}": expected a non-negative decimal with up to ${currency.scale} places`,
+      );
+    }
+    const [, integerPart = '0', fractionPart = ''] = match;
+    return new Money(BigInt(integerPart + fractionPart.padEnd(currency.scale, '0')), currency);
   }
 
-  /** Cria a partir de centavos. Ex.: fromMinor(10050n, BRL) → R$ 100,50. */
+  /**
+   * Converte texto decimal (pode ter sinal) — uso INTERNO, ex.: ao ler do banco.
+   * Ainda rejeita mais casas que a moeda permite (nunca arredonda escondido).
+   */
+  static fromDecimal(value: string, currency: Currency): Money {
+    const match = typeof value === 'string' ? SIGNED_AMOUNT.exec(value) : null;
+    if (!match) throw new DomainError(FailureCode.INVALID_AMOUNT, `Invalid amount: "${String(value)}"`);
+    const [, sign = '', integerPart = '0', fractionPart = ''] = match;
+    if (fractionPart.length > currency.scale) {
+      throw new DomainError(FailureCode.INVALID_AMOUNT, `Amount "${value}" has more than ${currency.scale} decimal places`);
+    }
+    const minor = BigInt(integerPart + fractionPart.padEnd(currency.scale, '0'));
+    return new Money(sign === '-' ? -minor : minor, currency);
+  }
+
+  static zero(currency: Currency | string): Money {
+    return new Money(0n, typeof currency === 'string' ? Currency.of(currency) : currency);
+  }
+
   static fromMinor(minor: bigint, currency: Currency): Money {
     return new Money(minor, currency);
   }
 
-  /**
-   * Converte um texto como "10", "10.5" ou "10.50" em Money.
-   *
-   * Rejeita (lança erro):
-   *  - mais casas decimais que a moeda permite, ex.: "1.234" (não arredondamos escondido);
-   *  - notação científica ("1e3"), espaços, vírgula ("1,00");
-   *  - qualquer coisa que não seja string (ex.: o número 10.5).
-   */
-  static fromDecimal(value: string, currency: Currency): Money {
-    if (typeof value !== 'string') {
-      throw new DomainError(FailureCode.INVALID_AMOUNT, 'Amount must be a decimal string');
-    }
-
-    // Expressão regular (regex) que valida o formato:
-    //   (-?)      → sinal de menos opcional
-    //   (\d+)     → um ou mais dígitos: a parte inteira
-    //   (\.(\d+))? → opcional: ponto seguido de dígitos (a parte decimal)
-    const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value);
-    if (!match) {
-      throw new DomainError(FailureCode.INVALID_AMOUNT, `Invalid amount: "${value}"`);
-    }
-    const [, sign = '', integerPart = '0', fractionPart = ''] = match;
-
-    if (fractionPart.length > currency.scale) {
-      throw new DomainError(
-        FailureCode.INVALID_AMOUNT,
-        `Amount "${value}" has more than ${currency.scale} decimal places`,
-      );
-    }
-
-    // Truque: juntar parte inteira + parte decimal completada com zeros.
-    // "100.5" → "100" + "50" → "10050" → 10050n centavos.
-    const minorDigits = integerPart + fractionPart.padEnd(currency.scale, '0');
-    const minor = BigInt(minorDigits);
-    return new Money(sign === '-' ? -minor : minor, currency);
-  }
-
-  /** Converte de volta para texto com casas fixas. Ex.: 10050n → "100.50". */
+  /** Texto com 2 casas: 10050n → "100.50". */
   toDecimal(): string {
     const scale = this.currency.scale;
     const negative = this.minor < 0n;
-    // padStart garante dígitos suficientes: 5n centavos → "005" → "0.05"
     const digits = (negative ? -this.minor : this.minor).toString().padStart(scale + 1, '0');
-    const integerPart = digits.slice(0, digits.length - scale);
-    const fractionPart = digits.slice(digits.length - scale);
-    const body = scale > 0 ? `${integerPart}.${fractionPart}` : integerPart;
+    const body = scale > 0 ? `${digits.slice(0, -scale)}.${digits.slice(-scale)}` : digits;
     return negative ? `-${body}` : body;
   }
 
-  // As operações abaixo NUNCA alteram este objeto: sempre devolvem um Money novo.
-
-  /** Soma. */
+  // Operações: NUNCA alteram este objeto; sempre devolvem um Money novo.
   add(other: Money): Money {
     this.assertSameCurrency(other);
     return new Money(this.minor + other.minor, this.currency);
   }
 
-  /** Subtração. */
   subtract(other: Money): Money {
     this.assertSameCurrency(other);
     return new Money(this.minor - other.minor, this.currency);
   }
 
-  /** Inverte o sinal: 10.00 → -10.00. */
   negate(): Money {
     return new Money(-this.minor, this.currency);
   }
 
-  /** É zero? */
   isZero(): boolean {
     return this.minor === 0n;
   }
 
-  /** É maior que zero? */
   isPositive(): boolean {
     return this.minor > 0n;
   }
 
-  /** É menor que zero? */
   isNegative(): boolean {
     return this.minor < 0n;
   }
 
-  /** Mesmo valor e mesma moeda? */
-  equals(other: Money): boolean {
-    return this.currency.equals(other.currency) && this.minor === other.minor;
-  }
-
-  /** Este valor é maior que o outro? */
-  greaterThan(other: Money): boolean {
-    this.assertSameCurrency(other);
-    return this.minor > other.minor;
-  }
-
-  /** Este valor é menor que o outro? */
-  lessThan(other: Money): boolean {
+  isLessThan(other: Money): boolean {
     this.assertSameCurrency(other);
     return this.minor < other.minor;
   }
 
-  /** Texto para logs/depuração. Ex.: "100.50 BRL". */
+  isGreaterThan(other: Money): boolean {
+    this.assertSameCurrency(other);
+    return this.minor > other.minor;
+  }
+
+  equals(other: Money): boolean {
+    return this.currency.equals(other.currency) && this.minor === other.minor;
+  }
+
+  /** Formato de contrato. Também é o que o JSON.stringify usa (bigint não vira JSON sozinho). */
+  toJSON(): MoneyProps {
+    return { amount: this.toDecimal(), currency: this.currency.code };
+  }
+
+  /** Para logs/depuração: "100.50 BRL". */
   toString(): string {
     return `${this.toDecimal()} ${this.currency.code}`;
   }
 
-  /**
-   * Define como o objeto vira JSON (usado pelo JSON.stringify e pelas respostas da API).
-   * Sem isso daria erro, porque o JSON não sabe representar `bigint`.
-   */
-  toJSON(): { amount: string; currency: string } {
-    return { amount: this.toDecimal(), currency: this.currency.code };
-  }
-
-  /** Garante que não estamos misturando moedas (ex.: BRL + USD). */
+  /** Operações entre moedas diferentes são erro de domínio. */
   private assertSameCurrency(other: Money): void {
     if (!this.currency.equals(other.currency)) {
       throw new DomainError(
