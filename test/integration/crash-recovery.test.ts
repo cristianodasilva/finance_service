@@ -1,43 +1,49 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import {
-  DeleteMessageCommand,
-  PurgeQueueCommand,
-  ReceiveMessageCommand,
-  SendMessageCommand,
-  type SQSClient,
-} from '@aws-sdk/client-sqs';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { config } from '../../src/config';
 import { createSqsClient } from '../../src/messaging/sqs.client';
 import { WagerQueueConsumer } from '../../src/messaging/wager-queue.consumer';
 import { ProcessWagerService } from '../../src/wagering/process-wager.service';
-import { WalletsService } from '../../src/wallets/wallets.service';
 import { OutboxPublisherWorker } from '../../src/workers/outbox-publisher.worker';
-import { createInstances, resetDatabase } from '../support/database';
+import { assertLedgerInvariant, createInstances, resetDatabase } from '../support/database';
+import { drainEvents } from '../support/events-queue';
+import { balanceOf, count, envelope, openWallet, request } from '../support/fixtures';
+import { ensureTestQueues } from '../support/queues';
 
-/**
- * Cenários de "crash depois do commit": o banco já gravou, mas o passo seguinte
- * (confirmar a mensagem / marcar o evento como publicado) não aconteceu.
- * Simulamos a falha com um cliente SQS "sabotado".
- */
-let orm: MikroORM;
-let realSqs: SQSClient;
-let wallets: WalletsService;
-const RUN = crypto.randomUUID();
+/** "Crash depois do commit": o banco confirmou, mas o passo seguinte não aconteceu. */
+let instances: MikroORM[];
+let sqs: SQSClient;
 
-/** Cliente SQS que FALHA na primeira vez que um tipo de comando é enviado. */
-function sabotage(commandName: string, when: 'before' | 'after'): SQSClient {
-  let failed = false;
+beforeAll(async () => {
+  await ensureTestQueues();
+  instances = await createInstances(2);
+  sqs = createSqsClient();
+});
+afterAll(async () => {
+  await Promise.all(instances.map((o) => o.close().catch(() => undefined)));
+});
+beforeEach(async () => {
+  await resetDatabase(instances[0]!);
+});
+afterEach(async () => {
+  await assertLedgerInvariant(instances[0]!);
+});
+
+/** Cliente SQS que falha (antes ou depois de executar) na 1ª vez que um comando é enviado. */
+function sabotage(commandName: string, when: 'before' | 'after' | 'hang'): SQSClient {
+  let done = false;
   return {
     send: async (command: { constructor: { name: string } }, options?: unknown) => {
-      const target = command.constructor.name === commandName && !failed;
-      if (target && when === 'before') {
-        failed = true;
+      const hit = command.constructor.name === commandName && !done;
+      if (hit && when === 'hang') return new Promise(() => undefined); // nunca responde (processo "travado")
+      if (hit && when === 'before') {
+        done = true;
         throw new Error(`simulated crash before ${commandName}`);
       }
-      const result = await realSqs.send(command as never, options as never);
-      if (target && when === 'after') {
-        failed = true;
+      const result = await sqs.send(command as never, options as never);
+      if (hit && when === 'after') {
+        done = true;
         throw new Error(`simulated crash after ${commandName}`);
       }
       return result;
@@ -45,79 +51,68 @@ function sabotage(commandName: string, when: 'before' | 'after'): SQSClient {
   } as unknown as SQSClient;
 }
 
-const query = (sql: string, params: unknown[] = []) => orm.em.fork().execute(sql, params);
-
-beforeAll(async () => {
-  [orm] = (await createInstances(1)) as [MikroORM];
-  realSqs = createSqsClient();
-  wallets = new WalletsService(orm.em);
-});
-afterAll(async () => {
-  await orm.close();
-});
-beforeEach(async () => {
-  await resetDatabase(orm);
-  for (const url of [config.sqs.wagerQueueUrl, config.sqs.eventsQueueUrl]) {
-    await realSqs.send(new PurgeQueueCommand({ QueueUrl: url })).catch(() => undefined);
-  }
-});
-
 describe('Crash depois do commit', () => {
-  test('consumidor: commit feito mas o ACK falha → mensagem volta e NÃO debita duas vezes', async () => {
-    const w = await wallets.create({ playerId: 'p1', currency: 'BRL', initialBalance: '100.00' });
-    await realSqs.send(
+  test('worker morto depois do commit e antes do ack → redelivery sem débito duplicado', async () => {
+    const db = instances[0]!;
+    const w = await openWallet(db, '100.00');
+    await sqs.send(
       new SendMessageCommand({
         QueueUrl: config.sqs.wagerQueueUrl,
-        MessageBody: JSON.stringify({
-          provider: 'prov', providerTransactionId: 'bet-1', kind: 'BET', playerId: 'p1',
-          walletId: w.id, currency: 'BRL', amount: '40.00',
-        }),
-        MessageGroupId: w.id,
-        MessageDeduplicationId: `${RUN}-bet-1`,
+        MessageBody: envelope(request(w, 'BET', 'bet-1', '40.00'), `msg-${w}`),
+        MessageGroupId: w,
+        MessageDeduplicationId: crypto.randomUUID(),
       }),
     );
+    // 1ª entrega: COMMIT feito, mas o ack (DeleteMessage) "cai".
+    const crashing = new WagerQueueConsumer(sabotage('DeleteMessageCommand', 'before'), new ProcessWagerService(db.em));
+    let first = 0;
+    for (let i = 0; i < 5 && first === 0; i++) first = await crashing.pollOnce(1);
+    expect(first).toBe(1);
+    expect(await balanceOf(db, w)).toBe('60.00');
 
-    // 1ª entrega: processa e faz COMMIT, mas o DeleteMessage (ack) "cai".
-    const consumer = new WagerQueueConsumer(sabotage('DeleteMessageCommand', 'before'), new ProcessWagerService(orm.em));
-    expect(await consumer.pollOnce(0)).toBe(1);
-    expect((await query(`select balance::text from wallets where id = ?`, [w.id]))[0]!.balance).toBe('60.00');
-
-    // A mensagem não foi confirmada → volta para a fila (após o tempo de visibilidade, ~2s).
+    // Outra instância recebe a mensagem de novo (volta após a visibilidade) e a inbox reconhece.
+    const healthy = new WagerQueueConsumer(sqs, new ProcessWagerService(instances[1]!.em));
     let redelivered = 0;
-    for (let i = 0; i < 10 && redelivered === 0; i++) redelivered = await consumer.pollOnce(1);
+    for (let i = 0; i < 15 && redelivered === 0; i++) redelivered = await healthy.pollOnce(1);
     expect(redelivered).toBe(1);
+    expect(await balanceOf(db, w)).toBe('60.00');
+    expect(await count(db, `wallet_ledger_entries where direction = 'DEBIT'`)).toBe(1);
+  }, 60_000);
 
-    // 2ª entrega: a inbox reconhece a mensagem → nada é debitado de novo.
-    expect((await query(`select balance::text from wallets where id = ?`, [w.id]))[0]!.balance).toBe('60.00');
-    expect((await query(`select count(*)::int as n from wallet_ledger_entries where direction = 'DEBIT'`))[0]!.n).toBe(1);
-    expect(await consumer.pollOnce(0)).toBe(0); // agora sim foi confirmada
-  }, 30_000);
+  test('publicador morre antes de publicar → outra instância assume; reenvio duplicado é seguro', async () => {
+    const [a, b] = instances as [MikroORM, MikroORM];
+    const w = await openWallet(a, '10.00'); // 2 eventos na outbox
+    const mine = (e: { data: Record<string, unknown> }) => e.data.walletId === w;
 
-  test('outbox: evento enviado mas não marcado como publicado → é reenviado (nunca perdido)', async () => {
-    await wallets.create({ playerId: 'p1', currency: 'BRL', initialBalance: '10.00' }); // gera 1 evento
-
-    // 1ª tentativa: o envio para a fila acontece, mas "cai" antes de marcar como publicado.
-    const publisher = new OutboxPublisherWorker(orm.em, sabotage('SendMessageCommand', 'after'));
-    await publisher.runOnce();
-    const [afterCrash] = await query(`select published_at, attempts from outbox_events`);
-    expect(afterCrash!.published_at).toBeNull(); // continua pendente
-    expect(afterCrash!.attempts).toBe(1);
-
-    // 2ª tentativa (quando chega a hora): publica e marca.
-    await query(`update outbox_events set available_at = now()`);
-    await publisher.runOnce();
-    const [recovered] = await query(`select published_at from outbox_events`);
-    expect(recovered!.published_at).not.toBeNull();
-
-    // Na fila: o mesmo eventId. (O SQS FIFO descarta a cópia dentro de 5 min pelo
-    // MessageDeduplicationId; fora dessa janela, quem consome descarta pelo eventId.)
-    const { Messages = [] } = await realSqs.send(
-      new ReceiveMessageCommand({ QueueUrl: config.sqs.eventsQueueUrl, MaxNumberOfMessages: 10 }),
+    // Instância A trava as linhas (FOR UPDATE) e "morre" sem publicar.
+    const stuck = new OutboxPublisherWorker(a.em, sabotage('SendMessageCommand', 'hang'));
+    void stuck.runOnce().catch(() => undefined);
+    await Bun.sleep(300);
+    // Morte do processo = a conexão dele cai. O PostgreSQL desfaz a transação e solta os locks.
+    const killed = await b.em.fork().execute(
+      `select pg_terminate_backend(pid) from pg_stat_activity
+        where datname = current_database() and state = 'idle in transaction' and pid <> pg_backend_pid()`,
     );
-    const ids = new Set(Messages.map((m) => JSON.parse(m.Body!).eventId));
-    expect(ids.size).toBe(1);
-    for (const m of Messages) {
-      await realSqs.send(new DeleteMessageCommand({ QueueUrl: config.sqs.eventsQueueUrl, ReceiptHandle: m.ReceiptHandle! }));
-    }
-  });
+    expect(killed.length).toBeGreaterThan(0);
+
+    // Instância B assume e publica tudo.
+    const publisherB = new OutboxPublisherWorker(b.em, sqs);
+    while ((await publisherB.runOnce()) > 0);
+    expect(await count(b, `outbox_events where published_at is null`)).toBe(0);
+    const events = await drainEvents(sqs, mine);
+    expect(events.length).toBe(2);
+
+    // Reenvio: publicado mas "morre" antes de marcar → enviado de novo com o MESMO eventId.
+    await b.em.fork().execute(`update outbox_events set published_at = null`);
+    const flaky = new OutboxPublisherWorker(b.em, sabotage('SendMessageCommand', 'after'));
+    await flaky.runOnce();
+    await b.em.fork().execute(`update outbox_events set next_attempt_at = now()`);
+    while ((await flaky.runOnce()) > 0);
+    const again = await drainEvents(sqs, mine);
+    // Toda cópia tem um eventId já conhecido: o consumidor descarta pelo eventId.
+    expect(again.every((e) => events.some((x) => x.eventId === e.eventId))).toBe(true);
+
+    // A instância A "morreu" (fica abandonada, como um processo morto). Repomos uma nova no lugar.
+    instances[0] = (await createInstances(1))[0]!;
+  }, 60_000);
 });

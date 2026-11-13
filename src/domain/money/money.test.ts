@@ -3,24 +3,21 @@ import { DomainError, FailureCode } from '../errors';
 import { Currency } from './currency';
 import { Money } from './money';
 
-const BRL = Currency.BRL;
-const brl = (v: string) => Money.fromDecimal(v, BRL);
+const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 
-function expectCode(fn: () => unknown, code: FailureCode) {
+function codeOf(fn: () => unknown): string | undefined {
   try {
     fn();
   } catch (e) {
-    expect(e).toBeInstanceOf(DomainError);
-    expect((e as DomainError).code).toBe(code);
-    return;
+    if (e instanceof DomainError) return e.code;
+    throw e;
   }
-  throw new Error(`Expected DomainError ${code}`);
+  return undefined;
 }
 
 describe('Money', () => {
   test('0.10 + 0.20 é exatamente 0.30 (sem erro de ponto flutuante)', () => {
     expect(brl('0.10').add(brl('0.20')).equals(brl('0.30'))).toBe(true);
-    expect(brl('0.1').add(brl('0.2')).toDecimal()).toBe('0.30');
   });
 
   test.each([
@@ -28,52 +25,56 @@ describe('Money', () => {
     ['100.5', '100.50', 10050n],
     ['0.01', '0.01', 1n],
     ['0', '0.00', 0n],
-    ['-12.34', '-12.34', -1234n],
     ['007.10', '7.10', 710n],
-  ])('converte "%s" em %s', (input, formatted, minor) => {
+  ])('from("%s") → "%s" (escala fixa de 2 casas)', (input, formatted, minor) => {
     const m = brl(input);
-    expect(m.toDecimal()).toBe(formatted);
+    expect(m.toJSON()).toEqual({ amount: formatted, currency: 'BRL' });
     expect(m.minor).toBe(minor);
   });
 
-  test('suporta valores muito maiores que Number.MAX_SAFE_INTEGER', () => {
-    const big = brl('99999999999999999999.99');
-    expect(big.add(brl('0.01')).toDecimal()).toBe('100000000000000000000.00');
-  });
-
-  test.each(['1.234', '10.999', '1e3', ' 1.00', '1.', '.5', 'abc', '', '1,00', '+1'])(
-    'rejeita entrada inválida "%s"',
-    (input) => expectCode(() => brl(input), FailureCode.INVALID_AMOUNT),
+  test.each(['NaN', 'Infinity', '-Infinity', '1e3', '', ' 1.00', '1.', '.5', 'abc', '1,00', '+1', '1.234', '10.999', '-1.00'])(
+    'rejeita entrada inválida "%s" (inclusive negativos e mais de 2 casas — nunca arredonda)',
+    (input) => expect(codeOf(() => brl(input))).toBe(FailureCode.INVALID_AMOUNT),
   );
 
-  test('rejeita entrada que não é string (ex.: um number do JS)', () => {
-    expectCode(() => Money.fromDecimal(10.5 as unknown as string, BRL), FailureCode.INVALID_AMOUNT);
+  test.each([10.5, NaN, Infinity, null, undefined])('rejeita amount que não é string (%p)', (amount) => {
+    expect(codeOf(() => Money.from({ amount: amount as unknown as string, currency: 'BRL' }))).toBe(FailureCode.INVALID_AMOUNT);
   });
 
-  test('subtrai e compara', () => {
-    expect(brl('100.00').subtract(brl('80.00')).toDecimal()).toBe('20.00');
+  test('rejeita moeda não suportada', () => {
+    expect(codeOf(() => Money.from({ amount: '1.00', currency: 'USD' }))).toBe(FailureCode.UNSUPPORTED_CURRENCY);
+  });
+
+  test('suporta valores muito maiores que Number.MAX_SAFE_INTEGER', () => {
+    expect(brl('99999999999999999999.99').add(brl('0.01')).toJSON().amount).toBe('100000000000000000000.00');
+  });
+
+  test('subtrai, nega e compara', () => {
+    expect(brl('100.00').subtract(brl('80.00')).toJSON().amount).toBe('20.00');
     expect(brl('20.00').subtract(brl('80.00')).isNegative()).toBe(true);
-    expect(brl('80.00').greaterThan(brl('20.00'))).toBe(true);
-    expect(brl('20.00').lessThan(brl('80.00'))).toBe(true);
+    expect(brl('5.00').negate().toJSON().amount).toBe('-5.00');
+    expect(brl('20.00').isLessThan(brl('80.00'))).toBe(true);
+    expect(brl('0.00').isZero()).toBe(true);
+    expect(brl('0.01').isPositive()).toBe(true);
   });
 
-  test('é imutável', () => {
+  test('conflito de moeda: operar moedas diferentes lança CURRENCY_MISMATCH', () => {
+    const usd = Money.fromMinor(100n, new (Currency as unknown as { new (c: string, s: number): Currency })('USD', 2));
+    expect(codeOf(() => brl('1.00').add(usd))).toBe(FailureCode.CURRENCY_MISMATCH);
+    expect(codeOf(() => brl('1.00').isLessThan(usd))).toBe(FailureCode.CURRENCY_MISMATCH);
+    expect(brl('1.00').equals(usd)).toBe(false);
+  });
+
+  test('é imutável: operações devolvem instâncias novas', () => {
     const a = brl('10.00');
     const b = a.add(brl('5.00'));
-    expect(a.toDecimal()).toBe('10.00');
-    expect(b.toDecimal()).toBe('15.00');
+    expect(a.toJSON().amount).toBe('10.00');
+    expect(b.toJSON().amount).toBe('15.00');
     expect(Object.isFrozen(a)).toBe(true);
-    expect(() => {
-      (a as unknown as { minor: bigint }).minor = 1n;
-    }).toThrow();
   });
 
-  test('vira JSON com o valor em texto decimal', () => {
-    expect(JSON.stringify(brl('10.5'))).toBe('{"amount":"10.50","currency":"BRL"}');
-  });
-
-  test('rejeita moedas não suportadas', () => {
-    expectCode(() => Currency.of('USD'), FailureCode.UNSUPPORTED_CURRENCY);
-    expect(Currency.of('BRL')).toBe(BRL);
+  test('JSON e toString', () => {
+    expect(JSON.stringify(brl('25'))).toBe('{"amount":"25.00","currency":"BRL"}');
+    expect(brl('25').toString()).toBe('25.00 BRL');
   });
 });

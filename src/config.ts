@@ -24,6 +24,8 @@ export const config = {
       process.env.SQS_WAGER_DLQ_URL ?? 'http://localhost:4566/000000000000/wager-transactions-dlq.fifo',
     /** Fila onde a outbox publica os eventos (WagerTransactionProcessed, etc.). */
     eventsQueueUrl: process.env.SQS_EVENTS_QUEUE_URL ?? 'http://localhost:4566/000000000000/wager-events.fifo',
+    /** Nome do consumidor: parte da chave da inbox (consumerName, messageId). */
+    consumerName: process.env.SQS_CONSUMER_NAME ?? 'wager-transactions-consumer',
     /** Liga/desliga o consumidor da fila nesta instância. */
     consumerEnabled: bool(process.env.SQS_CONSUMER_ENABLED, true),
     /** Quanto tempo cada "pergunta" à fila espera por mensagens (long polling). */

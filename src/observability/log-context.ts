@@ -1,24 +1,18 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
- * Campos de CORRELAÇÃO: identificam "de qual pedido" é cada linha de log.
- *
- * Com eles dá para filtrar todos os logs de uma mesma requisição/mensagem,
+ * Campos de CORRELAÇÃO dos logs: identificam a qual pedido pertence cada linha,
  * mesmo com milhares acontecendo ao mesmo tempo em várias instâncias.
  */
 export interface LogContext {
   correlationId: string;
   messageId?: string;
-  walletId?: string;
-  providerTransactionId?: string;
   transactionId?: string;
+  walletId?: string;
+  providerId?: string;
 }
 
-/**
- * AsyncLocalStorage: uma "mochila" que acompanha o fluxo de execução.
- * Tudo o que roda a partir de `runWithLogContext(...)` — inclusive código assíncrono
- * (await, callbacks) — enxerga o mesmo contexto, sem precisar passá-lo como parâmetro.
- */
+/** "Mochila" que acompanha o fluxo de execução, inclusive através de `await`. */
 const storage = new AsyncLocalStorage<LogContext>();
 
 export function runWithLogContext<T>(context: LogContext, fn: () => T): T {

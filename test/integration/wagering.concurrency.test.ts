@@ -1,185 +1,125 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { DomainError, FailureCode } from '../../src/domain/errors';
-import { Currency } from '../../src/domain/money/currency';
-import { Money } from '../../src/domain/money/money';
-import type { WagerCommand } from '../../src/domain/wager/wager-rules';
-import { ProcessWagerService } from '../../src/wagering/process-wager.service';
-import { WalletsService } from '../../src/wallets/wallets.service';
-import { createInstances, resetDatabase } from '../support/database';
+import type { ProcessWagerService } from '../../src/wagering/process-wager.service';
+import { assertLedgerInvariant, createInstances, resetDatabase } from '../support/database';
+import { balanceOf, count, openWallet, request, services, submit } from '../support/fixtures';
 
 /**
- * Testes de concorrência contra o PostgreSQL real.
- * Simulamos 3 instâncias da aplicação disputando a MESMA carteira ao mesmo tempo.
+ * Concorrência com PARALELISMO REAL contra o PostgreSQL: 3 "instâncias"
+ * (pools de conexão independentes) disputando as mesmas carteiras.
  */
 let instances: MikroORM[];
-let services: ProcessWagerService[];
-let wallets: WalletsService;
+let svc: ProcessWagerService[];
+const on = (i: number) => svc[i % svc.length]!;
 
 beforeAll(async () => {
   instances = await createInstances(3);
-  services = instances.map((orm) => new ProcessWagerService(orm.em));
-  wallets = new WalletsService(instances[0]!.em);
+  svc = services(instances);
 });
 afterAll(async () => {
-  await Promise.all(instances.map((orm) => orm.close()));
+  await Promise.all(instances.map((o) => o.close()));
 });
 beforeEach(async () => {
   await resetDatabase(instances[0]!);
 });
+// Invariante final de TODOS os testes: saldo == extrato reconstruído.
+afterEach(async () => {
+  await assertLedgerInvariant(instances[0]!);
+});
 
-const brl = (v: string) => Money.fromDecimal(v, Currency.BRL);
-/** Distribui as chamadas entre as 3 "instâncias" (0, 1, 2, 0, 1, 2...). */
-const instance = (i: number) => services[i % services.length]!;
+const db = () => instances[0]!;
 
-function bet(walletId: string, id: string, amount: string): WagerCommand {
-  return {
-    provider: 'prov',
-    providerTransactionId: id,
-    kind: 'BET',
-    playerId: 'player-1',
-    walletId,
-    amount: brl(amount),
-    roundId: 'round-1',
-    referenceProviderTransactionId: null,
-  };
-}
-
-async function openWallet(balance: string): Promise<string> {
-  const w = await wallets.create({ playerId: 'player-1', currency: 'BRL', initialBalance: balance });
-  return w.id;
-}
-
-/** Lê do banco: saldo, extrato e o saldo "reconstruído" a partir do extrato. */
-async function snapshot(walletId: string) {
-  const em = instances[0]!.em.fork();
-  const [wallet] = await em.execute(`select balance, version from wallets where id = ?`, [walletId]);
-  const [ledger] = await em.execute(
-    `select
-       coalesce(sum(case when direction = 'CREDIT' then amount else -amount end), 0)::text as rebuilt,
-       count(*) filter (where direction = 'DEBIT')::int as debits
-     from wallet_ledger_entries where wallet_id = ?`,
-    [walletId],
-  );
-  if (!wallet || !ledger) throw new Error(`Wallet ${walletId} not found`);
-  return {
-    balance: wallet.balance as string,
-    version: wallet.version as number,
-    rebuiltFromLedger: Money.fromDecimal(ledger.rebuilt, Currency.BRL).toDecimal(),
-    debits: ledger.debits as number,
-  };
-}
-
-describe('Concorrência na mesma carteira', () => {
-  test('CENÁRIO OBRIGATÓRIO: duas BETs de 80.00 simultâneas sobre 100.00 → 1 PROCESSED, 1 REJECTED, saldo 20.00', async () => {
-    const walletId = await openWallet('100.00');
-
+describe('Cenário obrigatório (seção 8)', () => {
+  test('100.00 BRL, duas BETs de 80.00 simultâneas → 1 PROCESSED, 1 REJECTED, saldo 20.00, 1 DEBIT', async () => {
+    const w = await openWallet(db(), '100.00');
     const results = await Promise.all([
-      instance(0).execute(bet(walletId, 'bet-A', '80.00'), { type: 'http', idempotencyKey: 'key-A' }),
-      instance(1).execute(bet(walletId, 'bet-B', '80.00'), { type: 'http', idempotencyKey: 'key-B' }),
+      submit(on(0), request(w, 'BET', 'bet-A', '80.00')),
+      submit(on(1), request(w, 'BET', 'bet-B', '80.00')),
     ]);
+    expect(results.map((r) => r.transaction.status).sort()).toEqual(['PROCESSED', 'REJECTED']);
+    expect(results.find((r) => r.transaction.status === 'REJECTED')!.transaction.failureCode).toBe(FailureCode.INSUFFICIENT_FUNDS);
+    expect(await balanceOf(db(), w)).toBe('20.00');
+    expect(await count(db(), `wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'`, [w])).toBe(1);
 
-    const statuses = results.map((r) => r.transaction.status).sort();
-    expect(statuses).toEqual(['PROCESSED', 'REJECTED']);
-    const rejected = results.find((r) => r.transaction.status === 'REJECTED')!;
-    expect(rejected.transaction.failureCode).toBe(FailureCode.INSUFFICIENT_FUNDS);
+    // Nenhum retry duplica o débito: repetir as duas dá o mesmo resultado.
+    const again = await Promise.all([
+      submit(on(2), request(w, 'BET', 'bet-A', '80.00')),
+      submit(on(0), request(w, 'BET', 'bet-B', '80.00')),
+    ]);
+    expect(again.every((r) => r.replayed)).toBe(true);
+    expect(await count(db(), `wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'`, [w])).toBe(1);
+  });
+});
 
-    const s = await snapshot(walletId);
-    expect(s.balance).toBe('20.00');
-    expect(s.debits).toBe(1);
-    expect(s.rebuiltFromLedger).toBe('20.00'); // saldo == extrato
+describe('Concorrência', () => {
+  test('a MESMA aposta enviada 50 vezes em paralelo → um único débito', async () => {
+    const w = await openWallet(db(), '100.00');
+    const results = await Promise.all(Array.from({ length: 50 }, (_, i) => submit(on(i), request(w, 'BET', 'bet-1', '30.00'))));
+    expect(new Set(results.map((r) => r.transaction.id)).size).toBe(1);
+    expect(results.filter((r) => !r.replayed).length).toBe(1);
+    expect(results.every((r) => r.balance.toJSON().amount === '70.00')).toBe(true);
+    expect(await balanceOf(db(), w)).toBe('70.00');
+    expect(await count(db(), `wallet_ledger_entries where direction = 'DEBIT'`)).toBe(1);
   });
 
-  test('30 BETs de 10.00 simultâneas em 3 instâncias sobre 100.00 → exatamente 10 aceitas, saldo 0.00', async () => {
-    const walletId = await openWallet('100.00');
+  test('30 BETs diferentes de 10.00 em 3 instâncias sobre 100.00 → exatamente 10 aceitas', async () => {
+    const w = await openWallet(db(), '100.00');
+    const results = await Promise.all(Array.from({ length: 30 }, (_, i) => submit(on(i), request(w, 'BET', `bet-${i}`, '10.00'))));
+    expect(results.filter((r) => r.transaction.status === 'PROCESSED').length).toBe(10);
+    expect(results.filter((r) => r.transaction.failureCode === FailureCode.INSUFFICIENT_FUNDS).length).toBe(20);
+    expect(await balanceOf(db(), w)).toBe('0.00');
+  });
 
-    const results = await Promise.all(
-      Array.from({ length: 30 }, (_, i) =>
-        instance(i).execute(bet(walletId, `bet-${i}`, '10.00'), { type: 'http', idempotencyKey: `key-${i}` }),
+  test('carteiras DIFERENTES processadas em paralelo não se bloqueiam nem se misturam', async () => {
+    const wallets = await Promise.all(Array.from({ length: 10 }, (_, i) => openWallet(db(), '50.00', `player-${i}`)));
+    await Promise.all(
+      wallets.flatMap((w, i) =>
+        Array.from({ length: 5 }, (_, j) => submit(on(i + j), request(w, 'BET', `w${i}-bet-${j}`, '10.00', { playerId: `player-${i}` }))),
       ),
     );
-
-    const processed = results.filter((r) => r.transaction.status === 'PROCESSED').length;
-    const rejected = results.filter((r) => r.transaction.status === 'REJECTED');
-    expect(processed).toBe(10);
-    expect(rejected.length).toBe(20);
-    expect(rejected.every((r) => r.transaction.failureCode === FailureCode.INSUFFICIENT_FUNDS)).toBe(true);
-
-    const s = await snapshot(walletId);
-    expect(s.balance).toBe('0.00');
-    expect(s.debits).toBe(10);
-    expect(s.rebuiltFromLedger).toBe(s.balance);
-    expect(s.version).toBe(11); // 1 (abertura) + 10 débitos
+    for (const w of wallets) expect(await balanceOf(db(), w)).toBe('0.00');
+    expect(await count(db(), `wallet_ledger_entries where direction = 'DEBIT'`)).toBe(50);
   });
 
-  test('ROLLBACK duplicado ao mesmo tempo → desfaz só UMA vez', async () => {
-    const walletId = await openWallet('100.00');
-    await instance(0).execute(bet(walletId, 'bet-1', '80.00'), { type: 'http', idempotencyKey: 'k-bet' });
-
-    const rollback = (id: string): WagerCommand => ({
-      ...bet(walletId, id, '80.00'),
-      kind: 'ROLLBACK',
-      referenceProviderTransactionId: 'bet-1',
-    });
+  test('REFUND e ROLLBACK simultâneos da mesma BET → só UMA reversão (sem crédito duplicado)', async () => {
+    const w = await openWallet(db(), '100.00');
+    await submit(on(0), request(w, 'BET', 'bet-1', '80.00'));
+    const ref = { referenceExternalTransactionId: 'bet-1' };
     const results = await Promise.all([
-      instance(0).execute(rollback('rb-1'), { type: 'http', idempotencyKey: 'k-rb-1' }),
-      instance(1).execute(rollback('rb-2'), { type: 'http', idempotencyKey: 'k-rb-2' }),
-      instance(2).execute(rollback('rb-3'), { type: 'http', idempotencyKey: 'k-rb-3' }),
+      submit(on(0), request(w, 'REFUND', 'refund-1', '80.00', ref)),
+      submit(on(1), request(w, 'ROLLBACK', 'rollback-1', '80.00', ref)),
+      submit(on(2), request(w, 'ROLLBACK', 'rollback-2', '80.00', ref)),
     ]);
-
-    const statuses = results.map((r) => r.transaction.status).sort();
-    expect(statuses).toEqual(['PROCESSED', 'REJECTED', 'REJECTED']);
-    expect(results.filter((r) => r.transaction.failureCode === FailureCode.ALREADY_ROLLED_BACK).length).toBe(2);
-
-    const s = await snapshot(walletId);
-    expect(s.balance).toBe('100.00');
-    expect(s.rebuiltFromLedger).toBe('100.00');
+    expect(results.filter((r) => r.transaction.status === 'PROCESSED').length).toBe(1);
+    expect(results.filter((r) => r.transaction.failureCode === FailureCode.REFERENCE_ALREADY_REVERSED).length).toBe(2);
+    expect(await balanceOf(db(), w)).toBe('100.00');
   });
 });
 
 describe('Idempotência', () => {
-  test('mesma Idempotency-Key 5x ao mesmo tempo → processa uma vez, as outras são repetição', async () => {
-    const walletId = await openWallet('100.00');
-    const command = bet(walletId, 'bet-1', '30.00');
-
-    const results = await Promise.all(
-      Array.from({ length: 5 }, (_, i) => instance(i).execute(command, { type: 'http', idempotencyKey: 'same-key' })),
-    );
-
-    const ids = new Set(results.map((r) => r.transaction.id));
-    expect(ids.size).toBe(1); // todas devolvem a MESMA transação
-    expect(results.filter((r) => !r.replayed).length).toBe(1);
-    expect((await snapshot(walletId)).balance).toBe('70.00'); // debitou uma vez só
+  test('replay devolve o resultado ORIGINAL, inclusive o saldo observado naquele momento', async () => {
+    const w = await openWallet(db(), '100.00');
+    const first = await submit(on(0), request(w, 'BET', 'bet-1', '30.00'));
+    await submit(on(1), request(w, 'BET', 'bet-2', '50.00')); // o saldo muda depois
+    const replay = await submit(on(2), request(w, 'BET', 'bet-1', '30.00'));
+    expect(replay.replayed).toBe(true);
+    expect(replay.transaction.id).toBe(first.transaction.id);
+    expect(replay.balance.toJSON()).toEqual({ amount: '70.00', currency: 'BRL' }); // não 20.00
   });
 
-  test('mesma chave com conteúdo diferente → IDEMPOTENCY_KEY_REUSED (conflito, não repetição)', async () => {
-    const walletId = await openWallet('100.00');
-    await instance(0).execute(bet(walletId, 'bet-1', '30.00'), { type: 'http', idempotencyKey: 'k' });
-
-    const error = await instance(1)
-      .execute(bet(walletId, 'bet-1', '31.00'), { type: 'http', idempotencyKey: 'k' })
-      .catch((e: unknown) => e);
+  test('mesma Idempotency-Key com payload diferente → IDEMPOTENCY_KEY_REUSED (conflito, não replay)', async () => {
+    const w = await openWallet(db(), '100.00');
+    await submit(on(0), request(w, 'BET', 'bet-1', '30.00'), { type: 'http' }, 'my-key');
+    const error = await submit(on(1), request(w, 'BET', 'bet-1', '31.00'), { type: 'http' }, 'my-key').catch((e) => e);
     expect(error).toBeInstanceOf(DomainError);
     expect((error as DomainError).code).toBe(FailureCode.IDEMPOTENCY_KEY_REUSED);
   });
 
-  test('mesmo id do provedor com outra chave → devolve a transação existente', async () => {
-    const walletId = await openWallet('100.00');
-    const first = await instance(0).execute(bet(walletId, 'bet-1', '30.00'), { type: 'http', idempotencyKey: 'k1' });
-    const again = await instance(1).execute(bet(walletId, 'bet-1', '30.00'), { type: 'sqs', messageId: 'msg-1' });
-    expect(again.transaction.id).toBe(first.transaction.id);
-    expect(again.replayed).toBe(true);
-    expect((await snapshot(walletId)).balance).toBe('70.00');
-  });
-});
-
-describe('Referências', () => {
-  test('WIN antes da BET → PENDING_REFERENCE, sem mexer no saldo', async () => {
-    const walletId = await openWallet('100.00');
-    const win: WagerCommand = { ...bet(walletId, 'win-1', '50.00'), kind: 'WIN', referenceProviderTransactionId: 'bet-x' };
-    const result = await instance(0).execute(win, { type: 'http', idempotencyKey: 'k-win' });
-    expect(result.transaction.status).toBe('PENDING_REFERENCE');
-    expect(result.transaction.nextAttemptAt).toBeInstanceOf(Date);
-    expect((await snapshot(walletId)).balance).toBe('100.00');
+  test('mesmo externalTransactionId com outra chave e outro conteúdo → PROVIDER_TRANSACTION_CONFLICT', async () => {
+    const w = await openWallet(db(), '100.00');
+    await submit(on(0), request(w, 'BET', 'bet-1', '30.00'), { type: 'http' }, 'k1');
+    const error = await submit(on(1), request(w, 'BET', 'bet-1', '99.00'), { type: 'http' }, 'k2').catch((e) => e);
+    expect((error as DomainError).code).toBe(FailureCode.PROVIDER_TRANSACTION_CONFLICT);
   });
 });

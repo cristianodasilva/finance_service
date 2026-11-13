@@ -1,157 +1,167 @@
 import { describe, expect, test } from 'bun:test';
+import { brl, id, processed, wager, walletWith } from '../../../test/support/domain-builders';
 import { FailureCode } from '../errors';
-import { Currency } from '../money/currency';
-import { Money } from '../money/money';
-import { Wallet } from '../wallet/wallet';
-import type { WagerKind } from './wager-kind';
-import { decideWager, type ReferenceSnapshot, type WagerCommand } from './wager-rules';
+import type { WagerTransaction } from './wager-transaction';
+import { decideWager, type ReferenceContext } from './wager-rules';
 
-const brl = (v: string) => Money.fromDecimal(v, Currency.BRL);
+const decide = (tx: WagerTransaction, wallet = walletWith('100.00'), reference?: ReferenceContext | null) =>
+  decideWager({ transaction: tx, wallet, reference, entryId: id('entry'), at: new Date() });
 
-function walletWith(balance: string): Wallet {
-  const w = Wallet.open({ id: 'w-1', playerId: 'p-1', currency: Currency.BRL });
-  if (brl(balance).isPositive()) w.credit(brl(balance));
-  return w;
-}
-
-function cmd(kind: WagerKind, amount: string, extra: Partial<WagerCommand> = {}): WagerCommand {
-  return {
-    provider: 'prov',
-    providerTransactionId: `${kind}-1`,
-    kind,
-    playerId: 'p-1',
-    walletId: 'w-1',
-    amount: brl(amount),
-    roundId: 'r-1',
-    referenceProviderTransactionId: kind === 'BET' ? null : 'BET-1',
-    ...extra,
-  };
-}
-
-function ref(kind: WagerKind, amount: string, extra: Partial<ReferenceSnapshot> = {}): ReferenceSnapshot {
-  return {
-    id: 'ref-id',
-    provider: 'prov',
-    kind,
-    status: 'PROCESSED',
-    playerId: 'p-1',
-    walletId: 'w-1',
-    amount: brl(amount),
-    roundId: 'r-1',
-    rolledBack: false,
-    refunded: false,
-    ...extra,
-  };
-}
+const ref = (tx: WagerTransaction, reversed = false): ReferenceContext => ({ transaction: tx, reversed });
+const betOf = (amount: string) => processed(wager('BET', amount, { externalTransactionId: 'bet-1' }));
+const withRef = { referenceExternalTransactionId: 'bet-1' };
 
 describe('decideWager', () => {
   describe('BET', () => {
-    test('debita quando há saldo', () => {
+    test('debita e gera 1 lançamento DEBIT', () => {
       const w = walletWith('100.00');
-      const d = decideWager({ command: cmd('BET', '80.00'), wallet: w, reference: undefined });
-      expect(d.status).toBe('PROCESSED');
-      expect(w.balance.toDecimal()).toBe('20.00');
+      const tx = wager('BET', '80.00');
+      const out = decide(tx, w);
+      expect(out.status).toBe('PROCESSED');
+      expect(out.status === 'PROCESSED' && out.entry?.direction).toBe('DEBIT');
+      expect(w.balance.toJSON().amount).toBe('20.00');
+      expect(tx.status).toBe('PROCESSED');
     });
 
-    test('rejeita com INSUFFICIENT_FUNDS e não altera a carteira', () => {
+    test('saldo insuficiente → REJECTED, sem lançamento e sem mexer na carteira', () => {
       const w = walletWith('20.00');
-      const d = decideWager({ command: cmd('BET', '80.00'), wallet: w, reference: undefined });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.INSUFFICIENT_FUNDS });
-      expect(w.balance.toDecimal()).toBe('20.00');
+      const tx = wager('BET', '80.00');
+      expect(decide(tx, w)).toEqual({ status: 'REJECTED', failureCode: FailureCode.INSUFFICIENT_FUNDS });
+      expect(tx.status).toBe('REJECTED');
       expect(w.version).toBe(1);
     });
 
-    test('rejeita carteira de outro jogador', () => {
-      const d = decideWager({ command: cmd('BET', '1.00', { playerId: 'outro' }), wallet: walletWith('10.00'), reference: undefined });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.PLAYER_MISMATCH });
+    test('carteira de outro jogador → PLAYER_MISMATCH', () => {
+      expect(decide(wager('BET', '1.00', { playerId: 'outro' }))).toEqual({ status: 'REJECTED', failureCode: FailureCode.PLAYER_MISMATCH });
     });
   });
 
-  describe('WIN / LOSS / REFUND', () => {
-    test('WIN credita', () => {
+  describe('WIN e LOSS', () => {
+    test('WIN sem referência credita', () => {
       const w = walletWith('20.00');
-      const d = decideWager({ command: cmd('WIN', '50.00'), wallet: w, reference: ref('BET', '80.00') });
-      expect(d.status).toBe('PROCESSED');
-      expect(w.balance.toDecimal()).toBe('70.00');
+      expect(decide(wager('WIN', '50.00'), w).status).toBe('PROCESSED');
+      expect(w.balance.toJSON().amount).toBe('70.00');
     });
 
-    test('LOSS não move saldo nem versão', () => {
+    test('WIN referenciando a BET da mesma rodada credita', () => {
       const w = walletWith('20.00');
-      const d = decideWager({ command: cmd('LOSS', '0.00'), wallet: w, reference: ref('BET', '80.00') });
-      expect(d).toEqual({ status: 'PROCESSED', movement: null });
+      expect(decide(wager('WIN', '50.00', withRef), w, ref(betOf('80.00'))).status).toBe('PROCESSED');
+    });
+
+    test('LOSS não move saldo, não gera lançamento, não muda a versão', () => {
+      const w = walletWith('20.00');
+      expect(decide(wager('LOSS', '0'), w)).toEqual({ status: 'PROCESSED', entry: null });
       expect(w.version).toBe(1);
     });
 
-    test('referência ausente → PENDING_REFERENCE', () => {
-      const d = decideWager({ command: cmd('WIN', '50.00'), wallet: walletWith('0'), reference: null });
-      expect(d.status).toBe('PENDING_REFERENCE');
+    test('WIN com referência ainda ausente → PENDING_REFERENCE', () => {
+      const tx = wager('WIN', '5.00', withRef);
+      expect(decide(tx, walletWith('0'), null).status).toBe('PENDING_REFERENCE');
+      expect(tx.status).toBe('PENDING_REFERENCE');
     });
 
-    test.each([
-      ['jogador', { playerId: 'outro' }],
-      ['carteira', { walletId: 'outra' }],
-      ['provedor', { provider: 'outro' }],
-      ['rodada', { roundId: 'r-2' }],
-    ])('referência de outro(a) %s → REFERENCE_MISMATCH', (_, diff) => {
-      const d = decideWager({ command: cmd('WIN', '5.00'), wallet: walletWith('0'), reference: ref('BET', '5.00', diff) });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.REFERENCE_MISMATCH });
+    test('WIN sobre BET já revertida → REFERENCE_ALREADY_REVERSED', () => {
+      expect(decide(wager('WIN', '5.00', withRef), walletWith('0'), ref(betOf('5.00'), true))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_ALREADY_REVERSED,
+      });
+    });
+  });
+
+  describe('REFUND', () => {
+    test('devolve a BET (valor igual)', () => {
+      const w = walletWith('20.00');
+      expect(decide(wager('REFUND', '80.00', withRef), w, ref(betOf('80.00'))).status).toBe('PROCESSED');
+      expect(w.balance.toJSON().amount).toBe('100.00');
     });
 
-    test('WIN apontando para outro WIN → REFERENCE_INVALID_KIND', () => {
-      const d = decideWager({ command: cmd('WIN', '5.00'), wallet: walletWith('0'), reference: ref('WIN', '5.00') });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.REFERENCE_INVALID_KIND });
+    test('valor diferente da BET → REVERSAL_AMOUNT_MISMATCH (reversão parcial fora de escopo)', () => {
+      expect(decide(wager('REFUND', '40.00', withRef), walletWith('0'), ref(betOf('80.00')))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REVERSAL_AMOUNT_MISMATCH,
+      });
     });
 
-    test('WIN sobre aposta rejeitada → REFERENCE_NOT_PROCESSED', () => {
-      const d = decideWager({ command: cmd('WIN', '5.00'), wallet: walletWith('0'), reference: ref('BET', '5.00', { status: 'REJECTED' }) });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.REFERENCE_NOT_PROCESSED });
+    test('só referencia BET → REFERENCE_INVALID_KIND', () => {
+      const win = processed(wager('WIN', '5.00', { externalTransactionId: 'bet-1' }));
+      expect(decide(wager('REFUND', '5.00', withRef), walletWith('0'), ref(win))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_INVALID_KIND,
+      });
     });
 
-    test('REFUND maior que a aposta → REFUND_EXCEEDS_BET', () => {
-      const d = decideWager({ command: cmd('REFUND', '90.00'), wallet: walletWith('0'), reference: ref('BET', '80.00') });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.REFUND_EXCEEDS_BET });
+    test('BET já revertida (REFUND ou ROLLBACK) → REFERENCE_ALREADY_REVERSED', () => {
+      expect(decide(wager('REFUND', '80.00', withRef), walletWith('0'), ref(betOf('80.00'), true))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_ALREADY_REVERSED,
+      });
     });
 
-    test('segundo REFUND da mesma aposta → ALREADY_REFUNDED', () => {
-      const d = decideWager({ command: cmd('REFUND', '80.00'), wallet: walletWith('0'), reference: ref('BET', '80.00', { refunded: true }) });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.ALREADY_REFUNDED });
+    test('BET rejeitada → REFERENCE_NOT_PROCESSED', () => {
+      const bet = wager('BET', '80.00', { externalTransactionId: 'bet-1' });
+      bet.reject(FailureCode.INSUFFICIENT_FUNDS);
+      expect(decide(wager('REFUND', '80.00', withRef), walletWith('0'), ref(bet))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_NOT_PROCESSED,
+      });
     });
   });
 
   describe('ROLLBACK', () => {
-    test('de BET devolve o valor apostado', () => {
+    test('de BET devolve o valor (CREDIT)', () => {
       const w = walletWith('20.00');
-      const d = decideWager({ command: cmd('ROLLBACK', '80.00'), wallet: w, reference: ref('BET', '80.00') });
-      expect(d).toEqual({ status: 'PROCESSED', movement: { direction: 'CREDIT', amount: brl('80.00') } });
-      expect(w.balance.toDecimal()).toBe('100.00');
+      const out = decide(wager('ROLLBACK', '80.00', withRef), w, ref(betOf('80.00')));
+      expect(out.status === 'PROCESSED' && out.entry?.direction).toBe('CREDIT');
+      expect(w.balance.toJSON().amount).toBe('100.00');
     });
 
-    test('de WIN retira o prêmio', () => {
+    test('de WIN retira o prêmio (DEBIT)', () => {
       const w = walletWith('70.00');
-      decideWager({ command: cmd('ROLLBACK', '50.00', { referenceProviderTransactionId: 'WIN-1' }), wallet: w, reference: ref('WIN', '50.00') });
-      expect(w.balance.toDecimal()).toBe('20.00');
+      const win = processed(wager('WIN', '50.00', { externalTransactionId: 'bet-1' }));
+      decide(wager('ROLLBACK', '50.00', withRef), w, ref(win));
+      expect(w.balance.toJSON().amount).toBe('20.00');
     });
 
-    test('de WIN já gasto → REVERSAL_WOULD_OVERDRAW (diferente de INSUFFICIENT_FUNDS)', () => {
-      const w = walletWith('10.00');
-      const d = decideWager({ command: cmd('ROLLBACK', '50.00'), wallet: w, reference: ref('WIN', '50.00') });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.REVERSAL_WOULD_OVERDRAW });
-      expect(w.balance.toDecimal()).toBe('10.00');
+    test('de WIN já gasto → REVERSAL_WOULD_OVERDRAW (≠ INSUFFICIENT_FUNDS)', () => {
+      const win = processed(wager('WIN', '50.00', { externalTransactionId: 'bet-1' }));
+      expect(decide(wager('ROLLBACK', '50.00', withRef), walletWith('10.00'), ref(win))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REVERSAL_WOULD_OVERDRAW,
+      });
     });
 
-    test('com valor diferente do original → ROLLBACK_AMOUNT_MISMATCH', () => {
-      const d = decideWager({ command: cmd('ROLLBACK', '79.99'), wallet: walletWith('0'), reference: ref('BET', '80.00') });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.ROLLBACK_AMOUNT_MISMATCH });
+    test('REFUND e depois ROLLBACK da MESMA BET → recusado (sem crédito duplicado)', () => {
+      expect(decide(wager('ROLLBACK', '80.00', withRef), walletWith('100.00'), ref(betOf('80.00'), true))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_ALREADY_REVERSED,
+      });
     });
 
-    test('segunda vez → ALREADY_ROLLED_BACK', () => {
-      const d = decideWager({ command: cmd('ROLLBACK', '80.00'), wallet: walletWith('0'), reference: ref('BET', '80.00', { rolledBack: true }) });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.ALREADY_ROLLED_BACK });
+    test('de LOSS não é permitido', () => {
+      const loss = processed(wager('LOSS', '0', { externalTransactionId: 'bet-1' }));
+      expect(decide(wager('ROLLBACK', '1.00', withRef), walletWith('0'), ref(loss))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_INVALID_KIND,
+      });
+    });
+  });
+
+  describe('Referência precisa bater', () => {
+    test.each([
+      ['jogador', { playerId: 'outro' }],
+      ['provider', { providerId: 'outro' }],
+      ['rodada', { roundId: 'r-2' }],
+      ['carteira', { walletId: 'outra' }],
+    ])('de outro(a) %s → REFERENCE_MISMATCH', (_, diff) => {
+      const bet = processed(wager('BET', '5.00', { externalTransactionId: 'bet-1', ...diff }));
+      expect(decide(wager('REFUND', '5.00', withRef), walletWith('0'), ref(bet))).toEqual({
+        status: 'REJECTED', failureCode: FailureCode.REFERENCE_MISMATCH,
+      });
     });
 
-    test('de LOSS não é permitido → REFERENCE_INVALID_KIND', () => {
-      const d = decideWager({ command: cmd('ROLLBACK', '0.00'), wallet: walletWith('0'), reference: ref('LOSS', '0.00') });
-      expect(d).toEqual({ status: 'REJECTED', failureCode: FailureCode.REFERENCE_INVALID_KIND });
+    test('referência que existe mas ainda não foi decidida → aguardar (PENDING_REFERENCE)', () => {
+      const pendingWin = wager('WIN', '5.00', { externalTransactionId: 'bet-1', referenceExternalTransactionId: 'b0' });
+      pendingWin.markPendingReference();
+      expect(decide(wager('ROLLBACK', '5.00', withRef), walletWith('0'), ref(pendingWin)).status).toBe('PENDING_REFERENCE');
     });
+  });
+
+  test('conflito de moeda entre transação e carteira → CURRENCY_MISMATCH', () => {
+    const w = walletWith('10.00');
+    const tx = wager('BET', '1.00');
+    Object.defineProperty(tx, 'money', { value: { ...brl('1.00'), currency: { code: 'USD', scale: 2, equals: () => false } } });
+    expect(decide(tx, w)).toEqual({ status: 'REJECTED', failureCode: FailureCode.CURRENCY_MISMATCH });
   });
 });

@@ -1,65 +1,55 @@
-import { Body, Controller, Get, Headers, Param, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Post, Res, UseGuards } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import type { Response } from 'express';
+import { ProviderAuthGuard } from '../auth/provider-auth.guard';
 import { requireUuid } from '../common/validation';
 import { WagerTransactionRecord } from '../database/entities/wager-transaction.record';
+import { transactionFromRecord } from '../database/mappers';
 import { DomainError, FailureCode } from '../domain/errors';
 import { ProcessWagerService } from './process-wager.service';
-import { parseWagerCommand } from './wager-command.parser';
-import { httpStatusFor, toWagerResponse } from './wager.mapper';
+import { parseIdempotencyKey, parseWagerRequest } from './wager-request.parser';
+import { httpStatusFor, submitView, transactionView } from './wager.view';
 
-@Controller('wagering/transactions')
+@Controller()
+@UseGuards(ProviderAuthGuard)
 export class WageringController {
   constructor(
     private readonly processWager: ProcessWagerService,
     private readonly em: EntityManager,
   ) {}
 
-  /**
-   * POST /wagering/transactions
-   * Header obrigatório: Idempotency-Key (o mesmo pedido repetido não é processado duas vezes).
-   */
-  @Post()
-  async create(
+  /** POST /wagering/transactions — header Idempotency-Key obrigatório (fonte da verdade). */
+  @Post('wagering/transactions')
+  async submit(
     @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Body() body: unknown,
-    // passthrough: deixa o Nest montar a resposta, mas nos permite escolher o status.
     @Res({ passthrough: true }) res: Response,
   ) {
-    if (!idempotencyKey || idempotencyKey.trim() === '' || idempotencyKey.length > 200) {
-      throw new DomainError(FailureCode.INVALID_REQUEST, 'Header "Idempotency-Key" is required (max 200 chars)');
-    }
-    const command = parseWagerCommand(body);
-    const { transaction, replayed } = await this.processWager.execute(command, {
-      type: 'http',
-      idempotencyKey,
-    });
-
-    res.status(httpStatusFor(transaction));
-    // Avisa o cliente que esta resposta é uma repetição de um pedido anterior.
-    if (replayed) res.setHeader('Idempotent-Replayed', 'true');
-    return toWagerResponse(transaction);
+    const key = parseIdempotencyKey(idempotencyKey);
+    const result = await this.processWager.execute(parseWagerRequest(body), key, { type: 'http' });
+    res.status(httpStatusFor(result.transaction));
+    return submitView(result);
   }
 
-  /**
-   * GET /wagering/transactions?provider=X&providerTransactionId=Y
-   * Busca pelo id que o provedor usa (útil para o provedor conferir o resultado).
-   */
-  @Get()
-  async findByProvider(@Query('provider') provider?: string, @Query('providerTransactionId') providerTxId?: string) {
-    if (!provider || !providerTxId) {
-      throw new DomainError(FailureCode.INVALID_REQUEST, 'Query params "provider" and "providerTransactionId" are required');
-    }
-    const record = await this.em.fork().findOne(WagerTransactionRecord, { provider, providerTransactionId: providerTxId });
-    if (!record) throw new DomainError(FailureCode.TRANSACTION_NOT_FOUND, 'Transaction not found');
-    return toWagerResponse(record);
+  /** GET /wagering/transactions/:transactionId */
+  @Get('wagering/transactions/:transactionId')
+  async findOne(@Param('transactionId') transactionId: string) {
+    const record = await this.em.fork().findOne(WagerTransactionRecord, { id: requireUuid(transactionId, 'transactionId') });
+    return this.view(record);
   }
 
-  /** GET /wagering/transactions/:id — busca pelo nosso id interno. */
-  @Get(':id')
-  async findOne(@Param('id') id: string) {
-    const record = await this.em.fork().findOne(WagerTransactionRecord, { id: requireUuid(id) });
+  /** GET /providers/:providerId/wagering/transactions/:externalTransactionId */
+  @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
+  async findByExternal(
+    @Param('providerId') providerId: string,
+    @Param('externalTransactionId') externalTransactionId: string,
+  ) {
+    const record = await this.em.fork().findOne(WagerTransactionRecord, { providerId, externalTransactionId });
+    return this.view(record);
+  }
+
+  private view(record: WagerTransactionRecord | null) {
     if (!record) throw new DomainError(FailureCode.TRANSACTION_NOT_FOUND, 'Transaction not found');
-    return toWagerResponse(record);
+    return transactionView(transactionFromRecord(record), { amount: record.resultingBalance, currency: record.currency });
   }
 }

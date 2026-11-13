@@ -1,32 +1,37 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EntityManager } from '@mikro-orm/postgresql';
 import { newId } from '../common/ids';
+import { DomainError, FailureCode } from '../domain/errors';
+import { Currency } from '../domain/money/currency';
+import { Money, type MoneyProps } from '../domain/money/money';
 import { metrics } from '../observability/metrics';
 
-export interface Divergence {
+export interface WalletReconciliation {
   walletId: string;
-  storedBalance: string;
-  ledgerBalance: string;
+  storedBalance: MoneyProps;
+  calculatedBalance: MoneyProps;
+  difference: MoneyProps;
+  consistent: boolean;
+  checkedEntries: number;
+  /** Extra: a versão gravada deve ser 1 (abertura) + número de movimentos após a abertura. */
   storedVersion: number;
-  ledgerVersion: number;
+  expectedVersion: number;
 }
 
-export interface ReconciliationReport {
-  checkedWallets: number;
-  divergences: Divergence[];
-  startedAt: string;
-  finishedAt: string;
+interface Row {
+  wallet_id: string;
+  currency: string;
+  stored_balance: string;
+  calculated_balance: string;
+  checked_entries: number;
+  stored_version: number;
+  expected_version: number;
 }
 
 /**
- * Reconciliação: confere se o saldo de cada carteira bate com o extrato.
- *
- * Para cada carteira, recalcula a partir do extrato:
- *   saldo esperado  = soma dos CRÉDITOS − soma dos DÉBITOS
- *   versão esperada = maior wallet_version do extrato (cada movimento sobe 1)
- *
- * Se algo não bater: LOG de erro + MÉTRICA + registro em reconciliation_divergences.
- * NUNCA altera o saldo.
+ * Reconciliação: saldo gravado × saldo reconstruído pelo extrato.
+ * Divergência → LOG de erro + MÉTRICA + registro em reconciliation_divergences + `consistent: false`.
+ * NUNCA corrige o saldo: corrigir sozinho esconderia a causa e apagaria a evidência.
  */
 @Injectable()
 export class ReconciliationService {
@@ -34,77 +39,76 @@ export class ReconciliationService {
 
   constructor(private readonly em: EntityManager) {}
 
-  async run(): Promise<ReconciliationReport> {
-    const startedAt = new Date();
-    const em = this.em.fork();
+  private static readonly SQL = `
+    select w.id as wallet_id, w.currency,
+           w.balance::text as stored_balance,
+           coalesce(sum(case when l.direction = 'CREDIT' then l.amount else -l.amount end), 0)::numeric(20,2)::text
+             as calculated_balance,
+           count(l.id)::int as checked_entries,
+           w.version as stored_version,
+           -- versão 1 na abertura; cada lançamento sobe 1 (o da abertura também é a versão 1)
+           coalesce(max(l.wallet_version), 1) as expected_version
+      from wallets w
+      left join wallet_ledger_entries l on l.wallet_id = w.id`;
 
-    // Uma única consulta compara TODAS as carteiras com o extrato.
-    const rows = await em.execute<
-      { wallet_id: string; stored_balance: string; ledger_balance: string; stored_version: number; ledger_version: number }[]
-    >(`
-      select w.id                                    as wallet_id,
-             w.balance::text                         as stored_balance,
-             coalesce(l.balance, 0)::numeric(20,2)::text as ledger_balance,
-             w.version                               as stored_version,
-             coalesce(l.max_version, 0)              as ledger_version
-        from wallets w
-        left join (
-          select wallet_id,
-                 sum(case when direction = 'CREDIT' then amount else -amount end) as balance,
-                 max(wallet_version) as max_version
-            from wallet_ledger_entries
-           group by wallet_id
-        ) l on l.wallet_id = w.id
-    `);
-
-    const divergences: Divergence[] = rows
-      .filter((r) => r.stored_balance !== r.ledger_balance || r.stored_version !== r.ledger_version)
-      .map((r) => ({
-        walletId: r.wallet_id,
-        storedBalance: r.stored_balance,
-        ledgerBalance: r.ledger_balance,
-        storedVersion: r.stored_version,
-        ledgerVersion: r.ledger_version,
-      }));
-
-    for (const d of divergences) {
-      metrics.reconciliationDivergences.inc();
-      // Log de ERRO: alguém precisa olhar. Só ids e valores agregados (nada sensível).
-      this.logger.error(
-        `Reconciliation divergence on wallet ${d.walletId}: stored=${d.storedBalance} (v${d.storedVersion}) ledger=${d.ledgerBalance} (v${d.ledgerVersion})`,
-      );
-      // Sinaliza: cria a divergência aberta, ou atualiza a que já existe para esta carteira.
-      await em.execute(
-        `insert into reconciliation_divergences
-           (id, wallet_id, stored_balance, stored_version, ledger_balance, ledger_version)
-         values (?, ?, ?, ?, ?, ?)
-         on conflict (wallet_id) where status = 'OPEN' do update set
-           stored_balance = excluded.stored_balance,
-           stored_version = excluded.stored_version,
-           ledger_balance = excluded.ledger_balance,
-           ledger_version = excluded.ledger_version,
-           last_detected_at = now(),
-           times_detected = reconciliation_divergences.times_detected + 1`,
-        [newId(), d.walletId, d.storedBalance, d.storedVersion, d.ledgerBalance, d.ledgerVersion],
-      );
-    }
-
-    if (divergences.length === 0) this.logger.log(`Reconciliation OK: ${rows.length} wallets checked`);
-    return {
-      checkedWallets: rows.length,
-      divergences,
-      startedAt: startedAt.toISOString(),
-      finishedAt: new Date().toISOString(),
-    };
+  /** POST /wallets/:walletId/reconciliation */
+  async reconcileWallet(walletId: string): Promise<WalletReconciliation> {
+    const [row] = await this.em.fork().execute<Row[]>(`${ReconciliationService.SQL} where w.id = ? group by w.id`, [walletId]);
+    if (!row) throw new DomainError(FailureCode.WALLET_NOT_FOUND, `Wallet ${walletId} not found`);
+    return this.evaluate(row);
   }
 
-  /** Lista as divergências ainda em aberto. */
+  /** POST /reconciliation/runs — todas as carteiras. */
+  async run() {
+    const startedAt = new Date();
+    const rows = await this.em.fork().execute<Row[]>(`${ReconciliationService.SQL} group by w.id`);
+    const results = await Promise.all(rows.map((r) => this.evaluate(r)));
+    const divergences = results.filter((r) => !r.consistent);
+    if (divergences.length === 0) this.logger.log(`Reconciliation OK: ${rows.length} wallets checked`);
+    return { checkedWallets: rows.length, divergences, startedAt: startedAt.toISOString(), finishedAt: new Date().toISOString() };
+  }
+
   async openDivergences() {
     return this.em.fork().execute(
-      `select id, wallet_id as "walletId", stored_balance::text as "storedBalance", ledger_balance::text as "ledgerBalance",
-              stored_version as "storedVersion", ledger_version as "ledgerVersion", status,
+      `select id, wallet_id as "walletId", stored_balance::text as "storedBalance", ledger_balance::text as "calculatedBalance",
+              stored_version as "storedVersion", ledger_version as "expectedVersion", status,
               first_detected_at as "firstDetectedAt", last_detected_at as "lastDetectedAt", times_detected as "timesDetected"
          from reconciliation_divergences where status = 'OPEN' order by first_detected_at`,
+    );
+  }
+
+  private async evaluate(r: Row): Promise<WalletReconciliation> {
+    const currency = Currency.of(r.currency);
+    const stored = Money.fromDecimal(r.stored_balance, currency);
+    const calculated = Money.fromDecimal(r.calculated_balance, currency);
+    const result: WalletReconciliation = {
+      walletId: r.wallet_id,
+      storedBalance: stored.toJSON(),
+      calculatedBalance: calculated.toJSON(),
+      difference: stored.subtract(calculated).toJSON(),
+      consistent: stored.equals(calculated) && r.stored_version === r.expected_version,
+      checkedEntries: r.checked_entries,
+      storedVersion: r.stored_version,
+      expectedVersion: r.expected_version,
+    };
+    if (!result.consistent) await this.flag(result);
+    return result;
+  }
+
+  private async flag(d: WalletReconciliation): Promise<void> {
+    metrics.reconciliationDivergences.inc();
+    this.logger.error(
+      `Reconciliation divergence on wallet ${d.walletId}: stored=${d.storedBalance.amount} (v${d.storedVersion}) ` +
+        `calculated=${d.calculatedBalance.amount} (v${d.expectedVersion})`,
+    );
+    await this.em.fork().execute(
+      `insert into reconciliation_divergences (id, wallet_id, stored_balance, stored_version, ledger_balance, ledger_version)
+       values (?, ?, ?, ?, ?, ?)
+       on conflict (wallet_id) where status = 'OPEN' do update set
+         stored_balance = excluded.stored_balance, stored_version = excluded.stored_version,
+         ledger_balance = excluded.ledger_balance, ledger_version = excluded.ledger_version,
+         last_detected_at = now(), times_detected = reconciliation_divergences.times_detected + 1`,
+      [newId(), d.walletId, d.storedBalance.amount, d.storedVersion, d.calculatedBalance.amount, d.expectedVersion],
     );
   }
 }
