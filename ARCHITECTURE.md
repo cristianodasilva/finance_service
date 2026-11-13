@@ -241,6 +241,7 @@ Banco e fila não compartilham transação: publicar antes do commit gera evento
 - **Publicadores concorrentes:** `SELECT … WHERE published_at IS NULL AND next_attempt_at <= now() … FOR UPDATE SKIP LOCKED` — lotes disjuntos (testado com 3 publicadores).
 - **Processo morre antes de publicar:** a conexão cai, o PostgreSQL desfaz e solta os locks; outra instância publica (testado matando a conexão com `pg_terminate_backend`).
 - **At-least-once:** se cair entre enviar e marcar, reenvia com o mesmo `eventId` (`MessageDeduplicationId = eventId`; consumidor descarta pelo `eventId`).
+- Envio em lotes de 10 (`SendMessageBatch`) em **faixas paralelas por `aggregateId`** (a mesma entidade fica sempre na mesma faixa e sai em ordem) e um único UPDATE para marcar os publicados. Falha parcial de um lote reagenda só as entradas falhas, e os lotes seguintes da faixa esperam.
 - Falha de envio: `OutboxMessage.scheduleRetry` (2 s, 4 s… até 5 min).
 
 Envelope `IntegrationEvent<T>`: `eventId`, `eventType`, `aggregateId`, `correlationId`, `causationId` (Idempotency-Key ou messageId que causou), `occurredAt` (ISO-8601), `version`, `data` (só `MoneyProps`, nunca `Money`). `WalletBalanceChanged.from(wallet, entry, ctx)` traz `direction`, `money`, `balanceBefore`, `balanceAfter`, `walletVersion` (permite ao consumidor ordenar e detectar lacunas).
@@ -285,6 +286,7 @@ Dois filtros globais traduzem erros sem que o domínio conheça HTTP: `DomainErr
 | Concorrência | `wagering.concurrency`, `workers`, `crash-recovery` | 3 pools independentes, paralelismo real |
 | Processos | `processes.test.ts` | **3 processos reais** da aplicação; SIGKILL e reinício |
 | Sistema | `scripts/race-check.ts` | as 3 instâncias do Compose atrás do nginx |
+| Carga | `bun run test:load` ([LOAD_TEST.md](docs/LOAD_TEST.md)) | ~250 req/s distribuído sem erros; hot wallet medido |
 
 **Invariante final em todos os testes de integração** (`afterEach`): saldo == extrato reconstruído, versão coerente e extrato sem buracos.
 
@@ -301,5 +303,6 @@ Lições registradas: testes não dependem de `PurgeQueue` (assíncrono, uma vez
 | Inbox e transações crescem indefinidamente | disco | arquivamento/TTL da inbox |
 | Reconciliação global é varredura síncrona | lenta com milhões de carteiras | incremental e agendada |
 | Métricas por instância | somar no Prometheus | padrão do Prometheus |
-| Sem teste de carga (`test:load`) | sem números de vazão | k6/autocannon contra o balanceador |
+| Hot wallet: ~3,4 conflitos/requisição, p99 ~2,5 s e 0,1–0,3% de 503 com 20 concorrentes na mesma carteira ([LOAD_TEST.md](docs/LOAD_TEST.md)) | latência sob disputa extrema | `FOR UPDATE` para carteiras quentes |
+| Vazão da outbox no ambiente local limitada pelo MiniStack (~150 eventos/s, uma chamada por vez) | lag de eventos sob carga alta (o dinheiro e a API não são afetados) | medir contra SQS real/LocalStack |
 | MiniStack em vez de LocalStack/AWS | diferenças sutis possíveis | validar em LocalStack/AWS |

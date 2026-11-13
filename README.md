@@ -4,6 +4,7 @@ Serviço de carteira e processamento de transações de aposta (BET, WIN, LOSS, 
 
 - **Stack:** Bun 1.4 · TypeScript (strict) · NestJS 12 · MikroORM 7 · PostgreSQL 18 · AWS SQS FIFO (MiniStack) · Docker Compose
 - **Decisões, trade-offs e limitações:** [ARCHITECTURE.md](ARCHITECTURE.md)
+- **Teste de carga (metodologia e análise):** [docs/LOAD_TEST.md](docs/LOAD_TEST.md)
 
 ## Sumário
 
@@ -108,6 +109,7 @@ docker compose up -d postgres aws aws-init   # integração usa PostgreSQL e SQS
 bun test                                     # tudo: 126 testes (~40 s)
 bun run test:unit                            # só domínio (sem infraestrutura)
 bun run test:integration
+bun run test:load                            # teste de carga contra o docker compose (ver docs/LOAD_TEST.md)
 ```
 
 - **Isolamento:** banco `finance_test` (criado e migrado automaticamente) e filas `*-test.fifo`. Podem rodar com o Docker no ar.
@@ -247,6 +249,7 @@ Entrega **at-least-once**: consumidores descartam repetições pelo `eventId`.
 | `bun test` | todos os testes |
 | `bun run migration:up` / `migration:down` / `migration:list` | migrations |
 | `bun scripts/race-check.ts [url]` | concorrência no sistema rodando |
+| `bun run test:load` | teste de carga (gera `docs/load-test-results.md`; análise em `docs/LOAD_TEST.md`) |
 | `bun scripts/send-wager.ts '<json>'` | envia pela fila |
 | `docker compose logs -f app-1` | logs de uma instância |
 
